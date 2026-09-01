@@ -165,11 +165,11 @@ fn gen_world(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 fn blocked(o: vec3<f32>, d: vec3<f32>, maxT: f32) -> bool {
-  var t = 1.0;
-  loop {
+  if(!(maxT < 2048.0)) { return true; }
+  for(var i = 1u; i < 2048u; i++) {
+    let t = f32(i);
     if(t >= maxT - 1.0) { break; }
     if(solidAt(o + d * t)) { return true; }
-    t += 1.0;
   }
   return false;
 }
@@ -2020,7 +2020,15 @@ const render = () => {
         const seq = v.getUint32(o, true);
         if(seq <= g.seq) continue;
         g.seq = seq;
-        for(let f = 0; f < 6; f++) g.input[f] = v.getFloat32(o + 4 + f * 4, true);
+        const clean = (val, lim) => Number.isFinite(val) ? Math.max(-lim, Math.min(lim, val)) : 0;
+        let mx = clean(v.getFloat32(o + 4, true), 1), mz = clean(v.getFloat32(o + 8, true), 1);
+        const ml = Math.hypot(mx, mz);
+        if(ml > 1) { mx /= ml; mz /= ml; }
+        g.input[0] = mx; g.input[1] = mz;
+        g.input[2] = clean(v.getFloat32(o + 12, true), 1e4);
+        g.input[3] = clean(v.getFloat32(o + 16, true), 15);
+        g.input[4] = clean(v.getFloat32(o + 20, true), 1.55);
+        g.input[5] = clean(v.getFloat32(o + 24, true), 1e9);
         if((g.input[3] | 0) & 1) g.fire = 1;
         if((g.input[3] | 0) & 8) g.dig = 1;
       }
