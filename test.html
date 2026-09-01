@@ -1704,6 +1704,37 @@ const render = () => {
     if(document.pointerLockElement !== cv) return;
     if(e.button === 2) dig = 1; else shoot = 1;
   });
+  const pad = { x: 0, z: 0, prev: [], calls: 0, seen: 0 };
+  globalThis.pad = pad;
+  const pollGamepad = (dt) => {
+    pad.calls++;
+    pad.x = 0; pad.z = 0;
+    const gp = [...(navigator.getGamepads() || [])].find(Boolean);
+    if(!gp) return;
+    pad.seen++;
+    const dz = (v) => Math.abs(v) < 0.15 ? 0 : Math.sign(v) * (Math.abs(v) - 0.15) / 0.85;
+    pad.x = dz(gp.axes[0]);
+    pad.z = -dz(gp.axes[1]);
+    const rx = gp.axes[2], ry = gp.axes[3];
+    const m = Math.hypot(rx, ry);
+    if(m > 0.12) {
+      const t = Math.min(1, (m - 0.12) / (0.85 - 0.12));
+      const curve = Math.pow(t, 2.2);
+      pad.edge = t >= 1 ? (pad.edge || 0) + dt : 0;
+      const boost = 1 + Math.min(1, pad.edge / 0.25);
+      const v = curve * 4.0 * boost;
+      P.yaw += (rx / m) * v * dt;
+      P.pitch = Math.max(-1.5, Math.min(1.5, P.pitch - (ry / m) * v * 0.6 * dt));
+    } else {
+      pad.edge = 0;
+    }
+    const down = (i) => !!(gp.buttons[i] && gp.buttons[i].pressed);
+    if(down(0)) keys.add('Space'); else if(pad.prev[0]) keys.delete('Space');
+    if(down(10)) keys.add('ShiftLeft'); else if(pad.prev[10]) keys.delete('ShiftLeft');
+    if(down(7) && !pad.prev[7]) shoot = 1;
+    if(down(6) && !pad.prev[6]) dig = 1;
+    pad.prev = gp.buttons.map((b) => b.pressed);
+  };
   const sendInput = (dt) => {
     if(!net.ws || net.ws.readyState !== 'open') return null;
     let aim = net.seq - 4;
@@ -1715,8 +1746,8 @@ const render = () => {
     const inp = {
       seq: ++net.inSeq,
       dt,
-      fx: (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0),
-      fz: (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0),
+      fx: Math.max(-1, Math.min(1, (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0) + pad.x)),
+      fz: Math.max(-1, Math.min(1, (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0) + pad.z)),
       yaw: P.yaw,
       pitch: P.pitch,
       jump: keys.has('Space'),
@@ -1762,6 +1793,7 @@ const render = () => {
     const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
     if(dt > 0) fps = fps ? fps * 0.9 + 0.1 / dt : 1 / dt;
+    pollGamepad(dt);
     const inp = sendInput(dt);
     if(inp) net.pending.push(inp);
     movePlayer(dt, inp);
