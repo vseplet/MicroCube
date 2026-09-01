@@ -671,6 +671,7 @@ const shiftWorld = (dx, dz) => {
     : { x0: 0, z0: from, x1: N, z1: from + CHUNK };
   job.x = job.x0; job.z = job.z0;
   pending.push(job);
+  for(const b of liveBullets) { b.x -= dx; b.z -= dz; }
 };
 const perf = { gen: 0, reduce: 0, reapply: 0, crater: 0 };
 globalThis.perf = perf;
@@ -982,7 +983,12 @@ const ICE = ROOM ? { iceServers: [
   { urls: 'stun:stun.nextcloud.com:443' },
 ] } : {};
 const lobby = { id: null, host: null, role: null };
-const lobbyPost = (op, body) => fetch(`${LOBBY}/r/${ROOM}/${op}`, {
+const SIG_LAG = +(new URLSearchParams(location.search).get('lag') || 0);
+const lobbyPost = async (op, body) => {
+  if(SIG_LAG) await new Promise((r) => setTimeout(r, SIG_LAG));
+  return lobbyFetch(op, body);
+};
+const lobbyFetch = (op, body) => fetch(`${LOBBY}/r/${ROOM}/${op}`, {
   method: 'POST', body: JSON.stringify(body), signal: AbortSignal.timeout(4000),
 }).then((r) => r.json());
 const lobbyJoin = async () => {
@@ -1007,7 +1013,13 @@ const lobbyJoin = async () => {
   return lobby.role;
 };
 
+let connecting = 0;
+let connectFails = 0;
 const connect = async () => {
+  const now = performance.now();
+  if(connecting && now - connecting < 20000) return;
+  connecting = now;
+  globalThis.pcMade = (globalThis.pcMade || 0) + 1;
   const pc = new RTCPeerConnection(ICE);
   net.pc = pc;
   const wireInit = (init) => init.onmessage = (e) => {
@@ -1028,6 +1040,8 @@ const connect = async () => {
   };
   const wireGame = (dc) => {
     dc.onopen = () => {
+      connecting = 0;
+      connectFails = 0;
       net.seq = 0; net.ack = 0; net.inSeq = 0;
       net.ticks.length = 0;
       net.pending.length = 0;
@@ -1057,12 +1071,18 @@ const connect = async () => {
           pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && ok();
         });
         await lobbyPost('send', { to: lobby.host, from: lobby.id, kind: 'answer', sdp: pc.localDescription.sdp });
-        return;
+        for(let w = 0; w < 20; w++) {
+          if(net.ws) return;
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        break;
       }
       await new Promise((r) => setTimeout(r, 500));
     }
   } catch {}
   try { pc.close(); } catch {}
+  connecting = 0;
+  if(++connectFails >= 3) { location.reload(); return; }
   setTimeout(connect, 2000);
 };
 
@@ -1760,7 +1780,9 @@ const render = () => {
       const vx = cp * Math.sin(inp.yaw), vy = spp, vz = cp * Math.cos(inp.yaw);
       const ex = P.x, ey = P.y + EYE, ez = P.z;
       const tAim = trace(ex, ey, ez, vx, vy, vz, 600) ? st.t : 600;
-      const mx = ex + Math.cos(inp.yaw) * 2.5, my = ey - 3, mz = ez - Math.sin(inp.yaw) * 2.5;
+      const mx = ex + vx * 3 + Math.cos(inp.yaw) * 2.5;
+      const my = ey + vy * 3 - 3;
+      const mz = ez + vz * 3 - Math.sin(inp.yaw) * 2.5;
       const dx = ex + vx * tAim - mx, dy = ey + vy * tAim - my, dz = ez + vz * tAim - mz;
       const l = Math.hypot(dx, dy, dz) || 1;
       spawnBullet(0, mx, my, mz, dx / l, dy / l, dz / l);
@@ -2048,7 +2070,13 @@ const render = () => {
       try {
         const { mail } = await lobbyPost('recv', { id: lobby.id });
         for(const mm of mail) {
-          if(mm.kind === 'knock' && !pendingOffers.has(mm.from)) {
+          if(mm.kind === 'knock') {
+            const old = pendingOffers.get(mm.from);
+            if(old) {
+              pendingOffers.delete(mm.from);
+              try { old.close(); } catch {}
+              conns.delete(old);
+            }
             offerGuest(mm.from).catch((e) => console.warn('offer:', e));
           }
           if(mm.kind === 'answer') {
