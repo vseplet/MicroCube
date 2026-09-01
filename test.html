@@ -20,6 +20,345 @@
 <div>
 <canvas id="cv"></canvas><div id="hud"></div><div id="aim"></div><div id="panel"></div>
 <div id="load"><span id="loadText">starting…</span><div id="bar"><i></i></div></div>
+<script type="text/wgsl" id="tickwgsl">
+struct Cfg {
+  players: u32,
+  hist: u32,
+  tick: u32,
+  maxVis: u32,
+  dt: f32,
+  reach: f32,
+  cells: u32,
+  _pad1: f32,
+};
+
+struct Player {
+  pos: vec3<f32>,
+  yaw: f32,
+  vel: vec3<f32>,
+  hp: f32,
+};
+
+struct Input {
+  move_: vec2<f32>,
+  yaw: f32,
+  shoot: f32,
+  pitch: f32,
+  aimT: f32,
+  _p1: f32,
+  _p2: f32,
+};
+
+struct Hit {
+  shooter: u32,
+  victim: u32,
+  dist: f32,
+  tick: u32,
+};
+
+@group(0) @binding(0) var<uniform> cfg: Cfg;
+@group(0) @binding(1) var<storage, read_write> players: array<Player>;
+@group(0) @binding(2) var<storage, read> inputs: array<Input>;
+@group(0) @binding(3) var<storage, read_write> hist: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> visCount: array<atomic<u32>>;
+@group(0) @binding(5) var<storage, read_write> visList: array<u32>;
+@group(0) @binding(6) var<storage, read_write> hitCount: array<atomic<u32>>;
+@group(0) @binding(7) var<storage, read_write> hits: array<Hit>;
+@group(0) @binding(8) var<storage, read_write> cellOf: array<u32>;
+@group(0) @binding(9) var<storage, read> cellAnchor: array<vec4<f32>>;
+@group(0) @binding(10) var<storage, read_write> cellVis: array<u32>;
+@group(0) @binding(11) var<storage, read_write> bullets: array<vec4<f32>>;
+@group(0) @binding(12) var<storage, read_write> craterReq: array<vec4<f32>>;
+@group(0) @binding(13) var<storage, read_write> world: array<u32>;
+@group(0) @binding(14) var<storage, read_write> worldBits: array<atomic<u32>>;
+
+const BULLET_R = 3.5;
+
+const CELL_W = 64.0;
+
+const SCALE = 10.0;
+const SEED = 7;
+const GROUND = 90.0;
+const HILLS = 40.0;
+const ISLE_Y = 170.0;
+const ISLE_SIZE = 60.0;
+const ISLE_AMOUNT = 0.7;
+const NY = 256.0;
+const WORLD = 1024.0;
+const ARENA = 896.0;
+
+fn hash2(x: i32, z: i32, s: i32) -> f32 {
+  var h = u32(x) * 374761393u + u32(z) * 668265263u + u32(s) * 1274126177u;
+  h = (h ^ (h >> 13u)) * 1274126177u;
+  h = h ^ (h >> 16u);
+  return f32(h) / 4294967296.0;
+}
+
+fn vnoise(x: f32, z: f32, s: i32) -> f32 {
+  let ix = i32(floor(x));
+  let iz = i32(floor(z));
+  let fx = x - floor(x);
+  let fz = z - floor(z);
+  let ux = fx * fx * (3.0 - 2.0 * fx);
+  let uz = fz * fz * (3.0 - 2.0 * fz);
+  let a = hash2(ix, iz, s);
+  let b = hash2(ix + 1, iz, s);
+  let c = hash2(ix, iz + 1, s);
+  let d = hash2(ix + 1, iz + 1, s);
+  return (a + (b - a) * ux) * (1.0 - uz) + (c + (d - c) * ux) * uz;
+}
+
+fn noise3(x: f32, y: f32, z: f32, s: i32) -> f32 {
+  let iy = i32(floor(y));
+  let f = y - floor(y);
+  let u = f * f * (3.0 - 2.0 * f);
+  return vnoise(x, z, s + iy * 37) * (1.0 - u) + vnoise(x, z, s + (iy + 1) * 37) * u;
+}
+
+fn heightAt(wx: f32, wz: f32) -> f32 {
+  let n = vnoise(wx / (12.0 * SCALE), wz / (12.0 * SCALE), SEED) * 0.55
+    + vnoise(wx / (5.0 * SCALE), wz / (5.0 * SCALE), SEED + 1) * 0.3
+    + vnoise(wx / (2.0 * SCALE), wz / (2.0 * SCALE), SEED + 2) * 0.15;
+  let ridge = 1.0 - abs(vnoise(wx / (22.0 * SCALE), wz / (22.0 * SCALE), SEED + 3) * 2.0 - 1.0);
+  return round(GROUND + (n - 0.5) * HILLS * 2.0 + ridge * ridge * HILLS * 0.8);
+}
+
+fn isleAt(wx: f32, y: f32, wz: f32) -> f32 {
+  if(abs(y - ISLE_Y) > ISLE_SIZE * 1.4) { return 0.0; }
+  return noise3(wx / ISLE_SIZE, y / (ISLE_SIZE * 0.6), wz / ISLE_SIZE, 53)
+    - abs(y - ISLE_Y) / (ISLE_SIZE * 1.4);
+}
+
+fn solidAt(p: vec3<f32>) -> bool {
+  if(p.y < 0.0) { return true; }
+  if(p.y >= NY) { return false; }
+  let x = i32(floor(p.x + WORLD * 0.5));
+  let z = i32(floor(p.z + WORLD * 0.5));
+  if(x < 0 || z < 0 || x >= i32(WORLD) || z >= i32(WORLD)) { return false; }
+  let y = u32(p.y);
+  let word = (u32(z) * u32(WORLD) + u32(x)) * 8u + (y >> 5u);
+  return ((world[word] >> (y & 31u)) & 1u) == 1u;
+}
+
+@compute @workgroup_size(64)
+fn gen_world(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let col = gid.x;
+  let n = u32(WORLD);
+  if(col >= n * n) { return; }
+  let x = col % n;
+  let z = col / n;
+  let wx = f32(x) - WORLD * 0.5;
+  let wz = f32(z) - WORLD * 0.5;
+  let h = heightAt(wx, wz);
+  for(var w = 0u; w < 8u; w++) {
+    var bits = 0u;
+    for(var b = 0u; b < 32u; b++) {
+      let y = f32(w * 32u + b);
+      var solid = y < h;
+      if(!solid && abs(y - ISLE_Y) < ISLE_SIZE * 1.4) {
+        solid = isleAt(wx, y, wz) > ISLE_AMOUNT;
+      }
+      if(solid) { bits |= 1u << b; }
+    }
+    world[col * 8u + w] = bits;
+  }
+}
+
+fn blocked(o: vec3<f32>, d: vec3<f32>, maxT: f32) -> bool {
+  var t = 1.0;
+  loop {
+    if(t >= maxT - 1.0) { break; }
+    if(solidAt(o + d * t)) { return true; }
+    t += 1.0;
+  }
+  return false;
+}
+
+@compute @workgroup_size(64)
+fn move_players(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if(i >= cfg.players) { return; }
+  var p = players[i];
+  if(p.hp < 0.5) {
+    hist[(cfg.tick % cfg.hist) * cfg.players + i] = vec4<f32>(p.pos, p.yaw);
+    return;
+  }
+  let inp = inputs[i];
+
+  p.yaw = inp.yaw;
+  let s = sin(p.yaw);
+  let c = cos(p.yaw);
+  let wish = vec3<f32>(inp.move_.x * c + inp.move_.y * s, 0.0, inp.move_.y * c - inp.move_.x * s);
+  let speed = 4.5 * SCALE * select(1.0, 1.9, (u32(inp.shoot + 0.5) & 4u) != 0u);
+  p.vel = vec3<f32>(wish.x * speed, p.vel.y - 26.0 * SCALE * cfg.dt, wish.z * speed);
+
+  var pos = p.pos;
+  let stepH = 6.0;
+  let nx = pos.x + p.vel.x * cfg.dt;
+  let nz = pos.z + p.vel.z * cfg.dt;
+  let wallX = solidAt(vec3<f32>(nx, pos.y + stepH + 1.0, pos.z)) || solidAt(vec3<f32>(nx, pos.y + 15.0, pos.z));
+  if(!wallX) { pos.x = nx; }
+  let wallZ = solidAt(vec3<f32>(pos.x, pos.y + stepH + 1.0, nz)) || solidAt(vec3<f32>(pos.x, pos.y + 15.0, nz));
+  if(!wallZ) { pos.z = nz; }
+
+  if(p.vel.y > 0.0) {
+    let ny = pos.y + p.vel.y * cfg.dt;
+    if(solidAt(vec3<f32>(pos.x, ny + 17.0, pos.z))) { p.vel.y = 0.0; } else { pos.y = ny; }
+  } else {
+    var ground = -1.0;
+    for(var k = i32(stepH); k >= -i32(stepH); k--) {
+      let yy = pos.y + f32(k);
+      if(yy < 0.0) { break; }
+      if(solidAt(vec3<f32>(pos.x, yy, pos.z)) && !solidAt(vec3<f32>(pos.x, yy + 1.0, pos.z))) {
+        ground = floor(yy) + 1.0;
+        break;
+      }
+    }
+    let ny = pos.y + p.vel.y * cfg.dt;
+    if(ground >= 0.0 && ny <= ground) {
+      pos.y = ground;
+      p.vel.y = 0.0;
+      if((u32(inp.shoot + 0.5) & 2u) != 0u) { p.vel.y = 9.9 * SCALE; }
+    } else {
+      pos.y = ny;
+    }
+  }
+  if(pos.y < 1.0) { pos.y = 1.0; p.vel.y = 0.0; }
+  pos.x = clamp(pos.x, -ARENA * 0.5, ARENA * 0.5);
+  pos.z = clamp(pos.z, -ARENA * 0.5, ARENA * 0.5);
+  p.pos = pos;
+  players[i] = p;
+
+  let slot = (cfg.tick % cfg.hist) * cfg.players + i;
+  hist[slot] = vec4<f32>(p.pos, p.yaw);
+
+  let cell = vec3<u32>(
+    u32(clamp((p.pos.x + WORLD * 0.5) / CELL_W, 0.0, 63.0)),
+    u32(clamp(p.pos.y / CELL_W, 0.0, 63.0)),
+    u32(clamp((p.pos.z + WORLD * 0.5) / CELL_W, 0.0, 63.0)));
+  cellOf[i] = cell.x | (cell.y << 8u) | (cell.z << 16u);
+}
+
+@compute @workgroup_size(8, 8)
+fn cell_visibility(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let a = gid.x;
+  let b = gid.y;
+  if(a >= cfg.cells || b >= cfg.cells || a > b) { return; }
+  var vis = 0u;
+  if(a == b) {
+    vis = 1u;
+  } else {
+    let pa = cellAnchor[a].xyz + vec3<f32>(0.0, 1.6 * SCALE, 0.0);
+    let ancB = cellAnchor[b].xyz;
+    let flat = normalize(vec3<f32>(ancB.z - pa.z, 0.0, pa.x - ancB.x));
+    for(var k = 0u; k < 5u && vis == 0u; k++) {
+      var aim = ancB;
+      if(k == 0u) { aim += vec3<f32>(0.0, 1.7 * SCALE, 0.0); }
+      else if(k == 1u) { aim += vec3<f32>(0.0, 1.0 * SCALE, 0.0); }
+      else if(k == 2u) { aim += vec3<f32>(0.0, 0.3 * SCALE, 0.0); }
+      else if(k == 3u) { aim += vec3<f32>(0.0, 1.3 * SCALE, 0.0) + flat * CELL_W * 0.2; }
+      else { aim += vec3<f32>(0.0, 1.3 * SCALE, 0.0) - flat * CELL_W * 0.2; }
+      let d = aim - pa;
+      let dist = length(d);
+      if(dist < 1.0) { vis = 1u; break; }
+      if(!blocked(pa, d / dist, dist)) { vis = 1u; }
+    }
+  }
+  cellVis[a * cfg.cells + b] = vis;
+  cellVis[b * cfg.cells + a] = vis;
+}
+
+@compute @workgroup_size(8, 8)
+fn visibility(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let a = gid.x;
+  let b = gid.y;
+  if(a >= cfg.players || b >= cfg.players || a >= b) { return; }
+  let pa = players[a].pos + vec3<f32>(0.0, 1.6 * SCALE, 0.0);
+  let base = players[b].pos;
+  let flat = normalize(vec3<f32>(base.z - pa.z, 0.0, pa.x - base.x));
+  var seen = false;
+  for(var k = 0u; k < 5u && !seen; k++) {
+    var aim = base;
+    if(k == 0u) { aim += vec3<f32>(0.0, 1.7 * SCALE, 0.0); }
+    else if(k == 1u) { aim += vec3<f32>(0.0, 1.0 * SCALE, 0.0); }
+    else if(k == 2u) { aim += vec3<f32>(0.0, 0.3 * SCALE, 0.0); }
+    else if(k == 3u) { aim += vec3<f32>(0.0, 1.3 * SCALE, 0.0) + flat * 0.3 * SCALE; }
+    else { aim += vec3<f32>(0.0, 1.3 * SCALE, 0.0) - flat * 0.3 * SCALE; }
+    let d = aim - pa;
+    let dist = length(d);
+    if(dist > 220.0) { return; }
+    if(!blocked(pa, d / dist, dist)) { seen = true; }
+  }
+  if(!seen) { return; }
+  let na = atomicAdd(&visCount[a], 1u);
+  if(na < cfg.maxVis) { visList[a * cfg.maxVis + na] = b; }
+  let nb = atomicAdd(&visCount[b], 1u);
+  if(nb < cfg.maxVis) { visList[b * cfg.maxVis + nb] = a; }
+}
+
+@compute @workgroup_size(64)
+fn fly_bullets(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if(i * 2u + 1u >= arrayLength(&bullets)) { return; }
+  var b0 = bullets[i * 2u];
+  var b1 = bullets[i * 2u + 1u];
+  if(b1.w < 0.5) { return; }
+  let packed = u32(b0.w + 0.5);
+  let shooter = packed & 1023u;
+  let delay = min(packed >> 10u, cfg.hist - 2u);
+
+  var pos = b0.xyz;
+  let step = b1.xyz * cfg.dt;
+  let sub = max(1u, u32(ceil(length(step) / 2.0)));
+  var dead = false;
+  for(var s = 0u; s < sub && !dead; s++) {
+    pos += step / f32(sub);
+    if(solidAt(pos)) {
+      let c = atomicAdd(&hitCount[1], 1u);
+      if(c < arrayLength(&craterReq)) { craterReq[c] = vec4<f32>(pos, 6.0); }
+      dead = true;
+      break;
+    }
+    for(var j = 0u; j < cfg.players; j++) {
+      if(j == shooter) { continue; }
+      if(players[j].hp < 0.5) { continue; }
+      let t = hist[((cfg.tick + cfg.hist - delay) % cfg.hist) * cfg.players + j].xyz;
+      let dh = vec2<f32>(pos.x - t.x, pos.z - t.z);
+      if(dot(dh, dh) < BULLET_R * BULLET_R && pos.y > t.y && pos.y < t.y + 1.9 * SCALE) {
+        let n = atomicAdd(&hitCount[0], 1u);
+        if(n < arrayLength(&hits)) { hits[n] = Hit(shooter, j, 0.0, cfg.tick); }
+        dead = true;
+        break;
+      }
+    }
+  }
+  bullets[i * 2u] = vec4<f32>(pos, b0.w);
+  bullets[i * 2u + 1u] = vec4<f32>(b1.xyz, select(b1.w - 1.0, 0.0, dead));
+}
+
+@compute @workgroup_size(64)
+fn carve_craters(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = min(atomicLoad(&hitCount[1]), arrayLength(&craterReq));
+  if(gid.y >= n) { return; }
+  let c = craterReq[gid.y];
+  let rad = i32(round(c.w));
+  let side = 2 * rad + 1;
+  if(i32(gid.x) >= side * side) { return; }
+  let dx = i32(gid.x) % side - rad;
+  let dz = i32(gid.x) / side - rad;
+  let x = i32(round(c.x)) + i32(WORLD) / 2 + dx;
+  let z = i32(round(c.z)) + i32(WORLD) / 2 + dz;
+  if(x < 0 || z < 0 || x >= i32(WORLD) || z >= i32(WORLD)) { return; }
+  let cy = i32(round(c.y));
+  let col = u32(z * i32(WORLD) + x) * 8u;
+  for(var dy = -rad; dy <= rad; dy++) {
+    if(dx * dx + dy * dy + dz * dz > rad * rad) { continue; }
+    let y = cy + dy;
+    if(y < 0 || y >= i32(NY)) { continue; }
+    atomicAnd(&worldBits[col + u32(y >> 5)], ~(1u << u32(y & 31)));
+  }
+}
+</script>
 <script type="module">
 import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js';
 
@@ -634,7 +973,7 @@ const hitFlash = () => {
 const INTERP_LAG = 60;
 
 // ─────────────────────────── LOBBY ───────────────────────────
-const ROOM = new URLSearchParams(location.search).get('room');
+const ROOM = new URLSearchParams(location.search).get('room') || 'dev';
 const LOBBY = new URLSearchParams(location.search).get('lobby') || 'https://microcube.vseplet.deno.net';
 const ICE = ROOM ? { iceServers: [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
@@ -671,11 +1010,7 @@ const lobbyJoin = async () => {
 const connect = async () => {
   const pc = new RTCPeerConnection(ICE);
   net.pc = pc;
-  const dc = pc.createDataChannel('game', { ordered: false, maxRetransmits: 0 });
-  dc.binaryType = 'arraybuffer';
-  const init = pc.createDataChannel('init');
-  init.binaryType = 'arraybuffer';
-  init.onmessage = (e) => {
+  const wireInit = (init) => init.onmessage = (e) => {
     const v = new DataView(e.data);
     if(v.getUint8(0) !== 3) return;
     const run = v.getUint32(1, true);
@@ -691,29 +1026,37 @@ const connect = async () => {
       addCrater(v.getFloat32(o, true), v.getFloat32(o + 4, true), v.getFloat32(o + 8, true), v.getFloat32(o + 12, true));
     }
   };
-  dc.onopen = () => {
-    net.seq = 0; net.ack = 0; net.inSeq = 0;
-    net.ticks.length = 0;
-    net.pending.length = 0;
-    net.seen.clear();
-    net.lastSnap = performance.now();
-    net.ws = dc;
+  const wireGame = (dc) => {
+    dc.onopen = () => {
+      net.seq = 0; net.ack = 0; net.inSeq = 0;
+      net.ticks.length = 0;
+      net.pending.length = 0;
+      net.seen.clear();
+      net.lastSnap = performance.now();
+      net.ws = dc;
+    };
+    dc.onclose = () => { net.ws = null; net.count = 0; setTimeout(connect, 1000); };
+    dc.onmessage = (e) => handleSnapshot(e.data);
   };
-  dc.onclose = () => { net.ws = null; net.count = 0; setTimeout(connect, 1000); };
-  dc.onmessage = (e) => handleSnapshot(e.data);
-
-  await pc.setLocalDescription(await pc.createOffer());
-  await new Promise((ok) => {
-    if(pc.iceGatheringState === 'complete') return ok();
-    pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && ok();
-  });
+  pc.ondatachannel = (ev) => {
+    const ch = ev.channel;
+    ch.binaryType = 'arraybuffer';
+    if(ch.label === 'init') wireInit(ch);
+    else if(ch.label === 'game') wireGame(ch);
+  };
   try {
-    await lobbyPost('send', { to: lobby.host, from: lobby.id, kind: 'offer', sdp: pc.localDescription.sdp });
+    await lobbyPost('send', { to: lobby.host, from: lobby.id, kind: 'knock', sdp: '' });
     for(let tries = 0; tries < 20; tries++) {
       const { mail } = await lobbyPost('recv', { id: lobby.id });
-      const ans = mail.find((mm) => mm.kind === 'answer');
-      if(ans) {
-        await pc.setRemoteDescription({ type: 'answer', sdp: ans.sdp });
+      const off = mail.find((mm) => mm.kind === 'offer');
+      if(off) {
+        await pc.setRemoteDescription({ type: 'offer', sdp: off.sdp });
+        await pc.setLocalDescription(await pc.createAnswer());
+        await new Promise((ok) => {
+          if(pc.iceGatheringState === 'complete') return ok();
+          pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && ok();
+        });
+        await lobbyPost('send', { to: lobby.host, from: lobby.id, kind: 'answer', sdp: pc.localDescription.sdp });
         return;
       }
       await new Promise((r) => setTimeout(r, 500));
@@ -1545,7 +1888,7 @@ const render = () => {
     maxStorageBufferBindingSize: Math.min(adapter.limits.maxStorageBufferBindingSize, 64 << 20),
   } });
   device.addEventListener('uncapturederror', (e) => console.error('host gpu:', e.error.message));
-  const src = await fetch('server/src/tick.wgsl', { cache: 'no-store' }).then((r) => r.text());
+  const src = document.getElementById('tickwgsl').textContent;
   const module = device.createShaderModule({ code: src });
   for(const m of (await module.getCompilationInfo()).messages) {
     if(m.type === 'error') { el.textContent = 'host: wgsl ' + m.message; return; }
@@ -1589,18 +1932,6 @@ const render = () => {
   const slotPool = [];
   let hostTx = 0;
   const conns = new Set();
-  const pendingPcs = [];
-  setInterval(() => {
-    for(let i = pendingPcs.length - 1; i >= 0; i--) {
-      const p = pendingPcs[i];
-      if(p.opened) { pendingPcs.splice(i, 1); continue; }
-      if(performance.now() - p.born > 15000) {
-        try { p.pc.close(); } catch {}
-        conns.delete(p.pc);
-        pendingPcs.splice(i, 1);
-      }
-    }
-  }, 5000);
   const hostCraterLog = [];
   const hostRunId = (Math.random() * 4294967296) >>> 0;
   const sendJournal = (ch) => {
@@ -1637,6 +1968,7 @@ const render = () => {
         g.seq = seq;
         for(let f = 0; f < 6; f++) g.input[f] = v.getFloat32(o + 4 + f * 4, true);
         if((g.input[3] | 0) & 1) g.fire = 1;
+        if((g.input[3] | 0) & 8) g.dig = 1;
       }
     };
     ch.onclose = () => {
@@ -1647,132 +1979,51 @@ const render = () => {
       if(bufs) device.queue.writeBuffer(bufs.players, slot * 32 + 28, new Float32Array([0]));
     };
   };
-  const pollSignal = async () => {
-    try {
-      const want = +(await fetch('http://127.0.0.1:9098/want', { signal: AbortSignal.timeout(5000) }).then((r) => r.text()));
-      if(want > 0) {
-        const batch = Math.min(want, 8);
-        const pcs = [], offers = [];
-        for(let k = 0; k < batch; k++) {
-          const pc = new RTCPeerConnection();
-          pendingPcs.push({ pc, born: performance.now(), opened: false });
-          const entry = pendingPcs[pendingPcs.length - 1];
-          conns.add(pc);
-          pc.onconnectionstatechange = () => {
-            if(['closed', 'failed', 'disconnected'].includes(pc.connectionState)) {
-              try { pc.close(); } catch {}
-              conns.delete(pc);
-            }
-          };
-          const dc = pc.createDataChannel('game', { ordered: false, maxRetransmits: 0 });
-          dc.binaryType = 'arraybuffer';
-          const init = pc.createDataChannel('init');
-          init.binaryType = 'arraybuffer';
-          let gameG = null, gameSlot = -1, journalSent = false;
-          const enter = () => {
-            if(journalSent && gameG) guests.set(gameSlot, gameG);
-          };
-          init.onopen = () => {
-            let i = 0;
-            do {
-              const chunk = hostCraterLog.slice(i, i + 3000);
-              const dv = new DataView(new ArrayBuffer(13 + chunk.length * 16));
-              dv.setUint8(0, 3);
-              dv.setUint32(1, hostRunId, true);
-              dv.setUint32(5, chunk.length, true);
-              dv.setUint32(9, stats.tick, true);
-              chunk.forEach((c, k) => { for(let f = 0; f < 4; f++) dv.setFloat32(13 + k * 16 + f * 4, c[f], true); });
-              init.send(dv.buffer);
-              i += 3000;
-            } while(i < hostCraterLog.length);
-            journalSent = true;
-            enter();
-          };
-          dc.onopen = () => {
-            entry.opened = true;
-            const slot = slotPool.length ? slotPool.pop() : nextSlot++;
-            if(slot >= NP) { pc.close(); return; }
-            const g = { dc, pc, input: new Float32Array(6), seq: 0, lastIn: performance.now() };
-            gameG = g; gameSlot = slot;
-            enter();
-            const r = 60 + (slot % 23) * 18, a = slot * 0.7;
-            if(bufs) device.queue.writeBuffer(bufs.players, slot * 32,
-              new Float32Array([Math.cos(a) * r, 200, Math.sin(a) * r, 0, 0, 0, 0, 1]));
-            dc.onmessage = (e) => {
-              g.lastIn = performance.now();
-              const v = new DataView(e.data);
-              if(v.getUint8(0) !== 1) return;
-              const count = v.getUint8(1);
-              for(let m = 0; m < count; m++) {
-                const o = 2 + m * 28;
-                const seq = v.getUint32(o, true);
-                if(seq <= g.seq) continue;
-                g.seq = seq;
-                for(let f = 0; f < 6; f++) g.input[f] = v.getFloat32(o + 4 + f * 4, true);
-                if((g.input[3] | 0) & 1) g.fire = 1;
-              }
-            };
-            dc.onclose = () => {
-              try { pc.close(); } catch {}
-              conns.delete(pc);
-              guests.delete(slot);
-              slotPool.push(slot);
-              if(bufs) device.queue.writeBuffer(bufs.players, slot * 32 + 28, new Float32Array([0]));
-            };
-          };
-          await pc.setLocalDescription(await pc.createOffer());
-          await new Promise((ok) => {
-            if(pc.iceGatheringState === 'complete') return ok();
-            pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && ok();
-          });
-          pcs.push(pc);
-          offers.push(btoa(pc.localDescription.sdp));
-        }
-        const reply = await fetch('http://127.0.0.1:9098/offers', { method: 'POST', body: offers.join('\n'), signal: AbortSignal.timeout(15000) })
-          .then((r) => r.text());
-        const lines = reply.split('\n').filter(Boolean);
-        for(let k = 0; k < lines.length; k++) {
-          const [, b64] = lines[k].split(' ');
-          if(b64) await pcs[k].setRemoteDescription({ type: 'answer', sdp: atob(b64) });
-        }
-      }
-    } catch (e) { if(!(e instanceof TypeError)) console.warn('host signal:', e); }
-    setTimeout(pollSignal, 1000);
-  };
-  pollSignal();
-
   if(ROOM) {
-    const acceptGuest = async (from, sdp) => {
+    const pendingOffers = new Map();
+    const offerGuest = async (from) => {
       const pc = new RTCPeerConnection(ICE);
       conns.add(pc);
       pc.onconnectionstatechange = () => {
         if(['closed', 'failed', 'disconnected'].includes(pc.connectionState)) {
           try { pc.close(); } catch {}
           conns.delete(pc);
+          if(pendingOffers.get(from) === pc) pendingOffers.delete(from);
         }
       };
-      pc.ondatachannel = (ev) => {
-        const ch = ev.channel;
-        ch.binaryType = 'arraybuffer';
-        if(ch.label === 'init') {
-          if(ch.readyState === 'open') sendJournal(ch);
-          else ch.onopen = () => sendJournal(ch);
-          return;
-        }
-        if(ch.label === 'game') wireGuest(ch, pc);
-      };
-      await pc.setRemoteDescription({ type: 'offer', sdp });
-      await pc.setLocalDescription(await pc.createAnswer());
+      const dc = pc.createDataChannel('game', { ordered: false, maxRetransmits: 0 });
+      dc.binaryType = 'arraybuffer';
+      const init = pc.createDataChannel('init');
+      init.binaryType = 'arraybuffer';
+      init.onopen = () => sendJournal(init);
+      dc.onopen = () => wireGuest(dc, pc);
+      await pc.setLocalDescription(await pc.createOffer());
       await new Promise((ok) => {
         if(pc.iceGatheringState === 'complete') return ok();
         pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && ok();
       });
-      await lobbyPost('send', { to: from, from: lobby.id, kind: 'answer', sdp: pc.localDescription.sdp });
+      pendingOffers.set(from, pc);
+      setTimeout(() => {
+        if(pendingOffers.get(from) === pc && pc.connectionState !== 'connected') {
+          pendingOffers.delete(from);
+          try { pc.close(); } catch {}
+          conns.delete(pc);
+        }
+      }, 15000);
+      await lobbyPost('send', { to: from, from: lobby.id, kind: 'offer', sdp: pc.localDescription.sdp });
     };
     setInterval(async () => {
       try {
         const { mail } = await lobbyPost('recv', { id: lobby.id });
-        for(const mm of mail) if(mm.kind === 'offer') acceptGuest(mm.from, mm.sdp).catch(() => {});
+        for(const mm of mail) {
+          if(mm.kind === 'knock' && !pendingOffers.has(mm.from)) {
+            offerGuest(mm.from).catch((e) => console.warn('offer:', e));
+          }
+          if(mm.kind === 'answer') {
+            const pc = pendingOffers.get(mm.from);
+            if(pc) pc.setRemoteDescription({ type: 'answer', sdp: mm.sdp }).catch((e) => console.warn('answer:', e));
+          }
+        }
       } catch {}
     }, 1000);
   }
@@ -1891,20 +2142,27 @@ const render = () => {
       }
       device.queue.writeBuffer(bufs.inputs, 0, inputs);
       device.queue.writeBuffer(bufs.visCount, 0, zeroVis);
-      let digCount = 0;
+      const digs = [];
+      const digAt = (lx, ly, lz, yaw, pitch) => {
+        const cp = Math.cos(pitch);
+        const d = [cp * Math.sin(yaw), Math.sin(pitch), cp * Math.cos(yaw)];
+        if(trace(lx, ly, lz, d[0], d[1], d[2], 120)) {
+          const t = st.t;
+          digs.push(lx + d[0] * t + wox, ly + d[1] * t, lz + d[2] * t + woz, 15);
+        }
+      };
       if(hi && globalThis.hostDig) {
         globalThis.hostDig = 0;
-        const cp = Math.cos(hi.pitch);
-        const d = [cp * Math.sin(hi.yaw), Math.sin(hi.pitch), cp * Math.cos(hi.yaw)];
-        if(trace(P.x, P.y + EYE, P.z, d[0], d[1], d[2], 120)) {
-          const t = st.t;
-          device.queue.writeBuffer(bufs.craterReq, 0, new Float32Array([
-            P.x + d[0] * t + wox, P.y + EYE + d[1] * t, P.z + d[2] * t + woz, 15,
-          ]));
-          digCount = 1;
-        }
+        digAt(P.x, P.y + EYE, P.z, hi.yaw, hi.pitch);
       }
-      device.queue.writeBuffer(bufs.hitCount, 0, new Uint32Array([0, digCount]));
+      for(const [gslot, g] of guests) {
+        if(gslot >= NP || !g.dig || digs.length >= 32) continue;
+        g.dig = 0;
+        digAt(lastPlayers[gslot * 8] - wox, lastPlayers[gslot * 8 + 1] + EYE, lastPlayers[gslot * 8 + 2] - woz,
+          g.input[2], g.input[4]);
+      }
+      if(digs.length) device.queue.writeBuffer(bufs.craterReq, 0, new Float32Array(digs));
+      device.queue.writeBuffer(bufs.hitCount, 0, new Uint32Array([0, digs.length / 4]));
       writeCfg(tick, cells);
       const maxBullets = Math.max(256, NP);
       for(const [gslot, g] of guests) {
