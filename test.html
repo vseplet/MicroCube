@@ -1,0 +1,2130 @@
+<html>
+<head>
+<meta charset="utf-8">
+<title>MicroCube @vseplet</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0a0c10; color: #dfe6f2; font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #cv { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; cursor: crosshair; }
+  #hud { position: fixed; left: 8px; top: 6px; font: 12px/1.4 monospace; white-space: pre; text-shadow: 0 0 3px #000, 0 0 3px #000; pointer-events: none; }
+  #aim { position: fixed; left: 50%; top: 50%; width: 9px; height: 9px; margin: -5px 0 0 -5px; pointer-events: none;
+         border: 1px solid rgba(255,255,255,.85); border-radius: 50%; mix-blend-mode: difference; }
+  #panel { position: fixed; right: 8px; top: 8px; width: 270px; }
+  body.clean #panel, body.clean #hud { display: none; }
+  #load { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 10px;
+          align-items: center; justify-content: center; background: #0a0c10; font: 12px/1.4 monospace; }
+  #load.done { display: none; }
+  #bar { width: 260px; height: 3px; background: #1e2430; }
+  #bar > i { display: block; height: 100%; width: 0; background: #7fa8d8; transition: width .15s linear; }
+</style>
+</head>
+<div>
+<canvas id="cv"></canvas><div id="hud"></div><div id="aim"></div><div id="panel"></div>
+<div id="load"><span id="loadText">starting…</span><div id="bar"><i></i></div></div>
+<script type="module">
+import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js';
+
+// ─────────────────────────── SETTINGS ───────────────────────────
+const SCALE = 10;
+const M = (metres) => metres * SCALE;
+
+const N = 1024;
+const NY = 256;
+const CELL = 8;
+const CHUNK = 32;
+const BLOCK = 1;
+const GROUND = M(9);
+const HILLS = M(4);
+const ISLE_Y = M(17);
+const ISLE_SIZE = M(6);
+const ISLE_AMOUNT = 0.7;
+const LOAD_BUDGET_MS = 3;
+const SEED = 7;
+
+const MOVE_SPEED = M(4.5);
+const RUN_MULT = 1.9;
+const JUMP_V = M(9.9);
+const GRAVITY = M(26);
+const EYE = M(1.62);
+const PLAYER_R = M(0.32);
+const STEP_H = Math.round(M(0.6));
+const MOUSE_SENS = 0.0022;
+const REACH = M(45);
+
+const SUN = [0.42, 0.82, 0.38];
+const SUN_COLOR = [255, 246, 214];
+const SUN_COS = 0.9985;
+const SUN_GLOW = 0.96;
+const FOG = { color: { r: 150, g: 170, b: 195 } };
+const SKY_TOP = [92, 132, 196];
+const SKY_HOR = [186, 206, 226];
+
+let DIG_R = 12;
+let DOF_START = 0.21;
+let DOF_END = 1.0;
+let DOF_R = 5;
+let RES_H = 280;
+let FOV_DEG = 70;
+let MAX_DIST = N / 2;
+let FOG_START = 0.49;
+let FOG_END = 0.8;
+let AMBIENT = 0.42;
+let SHADOW = true;
+let SHADOW_DIST = 84;
+let SHADOW_DARK = 0.5;
+let SHADOW_LOD = 0;
+let AO = true;
+let AO_STRENGTH = 0.6;
+
+// ─────────────────────────── WORLD ───────────────────────────
+const LMAX = Math.log2(Math.min(N, NY)) | 0;
+const CL = Math.log2(CELL) | 0, CM = CELL - 1, CELL3 = CELL ** 3;
+const NC = N / CELL, NCY = NY / CELL;
+const lv = Array.from({ length: LMAX + 1 }, (_, L) => (L > CL ? new Uint8Array((N >> L) * (NY >> L) * (N >> L)) : null));
+let wox = -(N >> 1), woz = -(N >> 1);
+
+const pyrBytes = lv.reduce((s, a) => s + (a ? a.byteLength : 0), 0);
+const cellB = new Int32Array(NC * NCY * NC).fill(-1);
+let blocks = new Uint8Array(CELL3 * 64);
+let blockCount = 0;
+const freeB = [];
+
+const cellAt = (x, y, z) => ((z >> CL) * NCY + (y >> CL)) * NC + (x >> CL);
+const inCell = (x, y, z) => ((z & CM) * CELL + (y & CM)) * CELL + (x & CM);
+const inBox = (x, y, z) => (x | y | z) >= 0 && x < N && y < NY && z < N;
+
+const dirtyBlocks = new Set();
+let dirtyCells = true, dirtyPyr = true;
+
+const uniType = (b) => -b - 2;
+const uniCode = (t) => -t - 2;
+
+const blockCell = new Int32Array(65536).fill(-1);
+
+const allocCell = (c, fill) => {
+  dirtyCells = true;
+  const b = freeB.length ? freeB.pop() : blockCount++;
+  if((b + 1) * CELL3 > blocks.length) {
+    const grown = new Uint8Array(blocks.length * 2);
+    grown.set(blocks);
+    blocks = grown;
+  }
+  blocks.fill(fill, b * CELL3, (b + 1) * CELL3);
+  if(b < blockCell.length) blockCell[b] = c;
+  dirtyBlocks.add(b);
+  return cellB[c] = b;
+};
+
+const voxAt = (x, y, z) => {
+  const b = cellB[cellAt(x, y, z)];
+  if(b >= 0) return blocks[b * CELL3 + inCell(x, y, z)];
+  return b === -1 ? 0 : uniType(b);
+};
+const voxSet = (x, y, z, t) => {
+  const c = cellAt(x, y, z);
+  let b = cellB[c];
+  if(b < 0) {
+    const was = b === -1 ? 0 : uniType(b);
+    if(was === t) return;
+    b = allocCell(c, was);
+  }
+  blocks[b * CELL3 + inCell(x, y, z)] = t;
+  dirtyBlocks.add(b);
+};
+
+const compact = () => {
+  for(const b of dirtyBlocks) {
+    const c = b < blockCell.length ? blockCell[b] : -1;
+    if(c < 0 || cellB[c] !== b) continue;
+    const o = b * CELL3, v = blocks[o];
+    let same = true;
+    for(let i = 1; i < CELL3; i++) if(blocks[o + i] !== v) { same = false; break; }
+    if(!same) continue;
+    cellB[c] = v === 0 ? -1 : uniCode(v);
+    blockCell[b] = -1;
+    freeB.push(b);
+    dirtyBlocks.delete(b);
+    dirtyCells = true;
+  }
+};
+const getVox = (x, y, z) => inBox(x, y, z) ? voxAt(x, y, z) : 0;
+
+const reduceBox = (x0, y0, z0, x1, y1, z1) => {
+  dirtyPyr = true;
+  x0 = Math.max(0, x0); y0 = Math.max(0, y0); z0 = Math.max(0, z0);
+  x1 = Math.min(N - 1, x1); y1 = Math.min(NY - 1, y1); z1 = Math.min(N - 1, z1);
+  for(let L = CL + 1; L <= LMAX; L++) {
+    const nx = N >> L, ny = NY >> L;
+    const cx = N >> (L - 1), cyy = NY >> (L - 1);
+    const d = lv[L - 1];
+    const sy = cx, sz = cx * cyy;
+    for(let z = z0 >> L; z <= z1 >> L; z++) for(let y = y0 >> L; y <= y1 >> L; y++) for(let x = x0 >> L; x <= x1 >> L; x++) {
+      const c = (2 * z * cyy + 2 * y) * cx + 2 * x;
+      const any = d === null
+        ? (cellB[c] !== -1 || cellB[c + 1] !== -1 || cellB[c + sy] !== -1 || cellB[c + sy + 1] !== -1
+          || cellB[c + sz] !== -1 || cellB[c + sz + 1] !== -1 || cellB[c + sz + sy] !== -1 || cellB[c + sz + sy + 1] !== -1)
+        : (d[c] || d[c + 1] || d[c + sy] || d[c + sy + 1] || d[c + sz] || d[c + sz + 1] || d[c + sz + sy] || d[c + sz + sy + 1]);
+      lv[L][(z * ny + y) * nx + x] = any ? 1 : 0;
+    }
+  }
+};
+
+const sphereEdit = (cx, cy, cz, r, t) => {
+  const R = Math.ceil(r) + 1;
+  const x0 = Math.round(cx), y0 = Math.round(cy), z0 = Math.round(cz);
+  const r2 = r * r;
+  for(let dz = -R; dz <= R; dz++) for(let dy = -R; dy <= R; dy++) for(let dx = -R; dx <= R; dx++) {
+    if(dx * dx + dy * dy + dz * dz > r2) continue;
+    const x = x0 + dx, y = y0 + dy, z = z0 + dz;
+    if(!inBox(x, y, z)) continue;
+    const v = voxAt(x, y, z);
+    if(t === 0 ? v === 0 : v !== 0) continue;
+    voxSet(x, y, z, t);
+  }
+  reduceBox(x0 - R, y0 - R, z0 - R, x0 + R, y0 + R, z0 + R);
+};
+
+// ─────────────────────────── TERRAIN ───────────────────────────
+const hash2 = (x, z, s) => {
+  let h = Math.imul(x | 0, 374761393) + Math.imul(z | 0, 668265263) + Math.imul(s | 0, 1274126177);
+  h = Math.imul(h ^ (h >>> 13), 1274126177); h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+};
+const vnoise = (x, z, s) => {
+  const ix = Math.floor(x), iz = Math.floor(z), fx = x - ix, fz = z - iz;
+  const ux = fx * fx * (3 - 2 * fx), uz = fz * fz * (3 - 2 * fz);
+  const a = hash2(ix, iz, s), b = hash2(ix + 1, iz, s), c = hash2(ix, iz + 1, s), d = hash2(ix + 1, iz + 1, s);
+  return (a + (b - a) * ux) * (1 - uz) + (c + (d - c) * ux) * uz;
+};
+
+const noise3 = (x, y, z, s) => {
+  const iy = Math.floor(y), f = y - iy, u = f * f * (3 - 2 * f);
+  return vnoise(x, z, s + iy * 37) * (1 - u) + vnoise(x, z, s + (iy + 1) * 37) * u;
+};
+
+const hsv = (h, s, v) => [5, 3, 1].map((n) => {
+  const k = (n + h * 6) % 6;
+  return Math.round((v - v * s * Math.max(0, Math.min(k, 4 - k, 1))) * 255);
+});
+
+const MATS = 14, SHADES = 3;
+const PAL = [[0, 0, 0]];
+for(let m = 0; m < MATS; m++) {
+  const u = m / (MATS - 1);
+  const hue = (0.70 + u * 0.38) % 1, sat = 0.52 - 0.34 * u, val = 0.26 + 0.58 * u;
+  for(let s = 0; s < SHADES; s++) PAL.push(hsv(hue, sat, val * (0.86 + s * 0.14)));
+}
+const base = (m) => 1 + m * SHADES;
+const pick = (m, x, y, z) => base(m) + ((hash2(x * 7 + y, z * 13 + y, 5) * SHADES) | 0);
+
+const heightAt = (wx, wz) => {
+  const n = vnoise(wx / (12 * SCALE), wz / (12 * SCALE), SEED) * 0.55
+    + vnoise(wx / (5 * SCALE), wz / (5 * SCALE), SEED + 1) * 0.3
+    + vnoise(wx / (2 * SCALE), wz / (2 * SCALE), SEED + 2) * 0.15;
+  const ridge = 1 - Math.abs(vnoise(wx / (22 * SCALE), wz / (22 * SCALE), SEED + 3) * 2 - 1);
+  return Math.round(GROUND + (n - 0.5) * HILLS * 2 + ridge * ridge * HILLS * 0.8);
+};
+const blockTop = (wx, wz) => Math.round(heightAt(wx, wz) / BLOCK) * BLOCK;
+
+const isleAt = (wx, y, wz) => Math.abs(y - ISLE_Y) > ISLE_SIZE * 1.4 ? 0
+  : noise3(wx / ISLE_SIZE, y / (ISLE_SIZE * 0.6), wz / ISLE_SIZE, 53) - Math.abs(y - ISLE_Y) / (ISLE_SIZE * 1.4);
+
+const genColumn = (x, z) => {
+  const wx = wox + x, wz = woz + z;
+  const h = blockTop(wx, wz);
+  const bx = Math.floor(wx / BLOCK), bz = Math.floor(wz / BLOCK);
+  let isle = 0, isleTop = false, cy = -1, b = -1;
+  for(let y = 0; y < NY; y++) {
+    let t = 0;
+    if((y >> CL) !== cy) { cy = y >> CL; b = cellB[cellAt(x, y, z)]; }
+    if(y >= h && y % BLOCK === 0) {
+      isle = isleAt(wx, y, wz);
+      isleTop = isle > ISLE_AMOUNT && isleAt(wx, y + BLOCK, wz) <= ISLE_AMOUNT;
+    }
+    const solid = y < h || isle > ISLE_AMOUNT;
+    if(solid) {
+      const depthBlocks = y < h ? Math.floor((h - 1 - y) / BLOCK) : (isleTop ? 0 : 2);
+      const by = Math.floor(y / BLOCK);
+      const lvl = (h - GROUND + HILLS) / (2 * HILLS) + (vnoise(wx / (6 * SCALE), wz / (6 * SCALE), 31) - 0.5) * 0.28;
+      const band = vnoise(wx / (40 * SCALE), wz / (40 * SCALE), 21) * 6 + y / (2.5 * SCALE);
+      const deep = y < h - BLOCK * 3;
+      const deepBand = vnoise((wx >> CL) / 3, (wz >> CL) / 3, 21) * 6 + (y >> CL);
+      const m = depthBlocks === 0 ? Math.max(0, Math.min(MATS - 1, (lvl * MATS) | 0))
+        : depthBlocks === 1 ? Math.max(0, Math.min(MATS - 1, (lvl * MATS) | 0) - 1)
+        : ((Math.floor(deep ? deepBand : band) % MATS) + MATS) % MATS;
+      if(deep) t = base(m) + 1;
+      else {
+        t = pick(m, bx, by, bz);
+        if(hash2(wx * 3, wz * 5, y) > 0.82) t = base(m) + (t - base(m) + 1) % SHADES;
+      }
+    }
+    if(b < 0) {
+      const was = b === -1 ? 0 : uniType(b);
+      if(was === t) continue;
+      b = allocCell(cellAt(x, y, z), was);
+    }
+    blocks[b * CELL3 + inCell(x, y, z)] = t;
+    dirtyBlocks.add(b);
+  }
+};
+const pending = [];
+const shiftWorld = (dx, dz) => {
+  const s = dx ? Math.sign(dx) : Math.sign(dz);
+  const axis = dx ? 0 : 2;
+
+  const moveGrid = (arr, nx, ny, step, blank = 0) => {
+    if(axis === 0) {
+      for(let i = 0; i < ny * nx; i++) {
+        const row = i * nx;
+        if(s > 0) { arr.copyWithin(row, row + step, row + nx); arr.fill(blank, row + nx - step, row + nx); }
+        else { arr.copyWithin(row + step, row, row + nx - step); arr.fill(blank, row, row + step); }
+      }
+    } else {
+      const plane = nx * ny, total = plane * nx;
+      if(s > 0) { arr.copyWithin(0, step * plane, total); arr.fill(blank, total - step * plane, total); }
+      else { arr.copyWithin(step * plane, 0, total - step * plane); arr.fill(blank, 0, step * plane); }
+    }
+  };
+
+  const stepC = CHUNK / CELL;
+  for(let z = 0; z < NC; z++) for(let y = 0; y < NCY; y++) for(let x = 0; x < NC; x++) {
+    const gone = axis === 0 ? (s > 0 ? x < stepC : x >= NC - stepC) : (s > 0 ? z < stepC : z >= NC - stepC);
+    const c = (z * NCY + y) * NC + x;
+    if(gone && cellB[c] >= 0) { freeB.push(cellB[c]); cellB[c] = -1; }
+  }
+  moveGrid(cellB, NC, NCY, stepC, -1);
+  dirtyCells = true; dirtyPyr = true;
+  let topRebuild = CL + 1;
+  for(let L = CL + 1; L <= LMAX; L++) {
+    const step = CHUNK >> L;
+    if(step < 1 || (step << L) !== CHUNK) { topRebuild = L; break; }
+    moveGrid(lv[L], N >> L, NY >> L, step);
+    topRebuild = L + 1;
+  }
+  for(let L = topRebuild; L <= LMAX; L++) {
+    const nx = N >> L, ny = NY >> L, cx = N >> (L - 1), cyy = NY >> (L - 1);
+    const d = lv[L - 1], sy = cx, sz = cx * cyy;
+    for(let z = 0; z < nx; z++) for(let y = 0; y < ny; y++) for(let x = 0; x < nx; x++) {
+      const c = (2 * z * cyy + 2 * y) * cx + 2 * x;
+      const any = d === null
+        ? (cellB[c] !== -1 || cellB[c + 1] !== -1 || cellB[c + sy] !== -1 || cellB[c + sy + 1] !== -1
+          || cellB[c + sz] !== -1 || cellB[c + sz + 1] !== -1 || cellB[c + sz + sy] !== -1 || cellB[c + sz + sy + 1] !== -1)
+        : (d[c] || d[c + 1] || d[c + sy] || d[c + sy + 1] || d[c + sz] || d[c + sz + 1] || d[c + sz + sy] || d[c + sz + sy + 1]);
+      lv[L][(z * ny + y) * nx + x] = any ? 1 : 0;
+    }
+  }
+
+  if(axis === 0) wox += s * CHUNK; else woz += s * CHUNK;
+
+  for(let i = pending.length - 1; i >= 0; i--) {
+    const j = pending[i];
+    if(axis === 0) { j.x0 -= s * CHUNK; j.x1 -= s * CHUNK; j.x -= s * CHUNK; } else { j.z0 -= s * CHUNK; j.z1 -= s * CHUNK; j.z -= s * CHUNK; }
+    if(j.x1 <= 0 || j.z1 <= 0 || j.x0 >= N || j.z0 >= N) { pending.splice(i, 1); continue; }
+    const cx0 = Math.max(0, j.x0), cz0 = Math.max(0, j.z0);
+    if(cx0 !== j.x0 || cz0 !== j.z0 || j.x1 > N || j.z1 > N) {
+      j.x0 = cx0; j.z0 = cz0; j.x1 = Math.min(N, j.x1); j.z1 = Math.min(N, j.z1);
+      j.x = j.x0; j.z = j.z0;
+    } else if(j.x < j.x0 || j.z < j.z0) { j.x = j.x0; j.z = j.z0; }
+  }
+
+  const from = s > 0 ? N - CHUNK : 0;
+  const job = axis === 0
+    ? { x0: from, z0: 0, x1: from + CHUNK, z1: N }
+    : { x0: 0, z0: from, x1: N, z1: from + CHUNK };
+  job.x = job.x0; job.z = job.z0;
+  pending.push(job);
+};
+const perf = { gen: 0, reduce: 0, reapply: 0, crater: 0 };
+globalThis.perf = perf;
+const pumpPending = (budgetMs) => {
+  if(!pending.length) return;
+  if(pending.length > 1) budgetMs *= Math.min(3, pending.length);
+  const t0 = performance.now();
+  while(pending.length && performance.now() - t0 < budgetMs) {
+    const job = pending[0];
+    const z0 = job.z;
+    const tIter = performance.now();
+    let count = 0;
+    while(job.z < job.z1 && count < 256) {
+      genColumn(job.x, job.z);
+      count++;
+      if(++job.x >= job.x1) { job.x = job.x0; job.z++; }
+    }
+    const tGen = performance.now();
+    reduceBox(job.x0, 0, z0, job.x1, NY - 1, Math.min(job.z1, job.z + 1));
+    const tRed = performance.now();
+    perf.gen += tGen - tIter; perf.reduce += tRed - tGen;
+    if(job.z >= job.z1) {
+      pending.shift();
+      reapplyCraters(job.x0, job.z0, job.x1, job.z1);
+      perf.reapply += performance.now() - tRed;
+    }
+  }
+};
+
+// ─────────────────────────── RAYCAST ───────────────────────────
+const st = { t: 0, axis: 0, vx: 0, vy: 0, vz: 0, type: 0, nx: 0, ny: 0, nz: 0, clipT0: 0, clipT1: 0 };
+const EPS = 1e-5;
+
+const exitFast = (ox, oy, oz, idx1, idy1, idz1, size, ix, iy, iz) => {
+  const bx = ix * size, by = iy * size, bz = iz * size;
+  let tx = Infinity, ty = Infinity, tz = Infinity;
+  if(idx1 > 0) tx = (bx + size - ox) * idx1; else if(idx1 < 0) tx = (bx - ox) * idx1;
+  if(idy1 > 0) ty = (by + size - oy) * idy1; else if(idy1 < 0) ty = (by - oy) * idy1;
+  if(idz1 > 0) tz = (bz + size - oz) * idz1; else if(idz1 < 0) tz = (bz - oz) * idz1;
+  let t = tx, axis = 0;
+  if(ty < t) { t = ty; axis = 1; }
+  if(tz < t) { t = tz; axis = 2; }
+  st.axis = axis;
+  return t;
+};
+
+const snapHit = (ox, oy, oz, idx1, idy1, idz1, t0) => {
+  let ix = st.vx, iy = st.vy, iz = st.vz;
+  for(let k = 0; k < 4; k++) {
+    let tb = -Infinity, axis = 0;
+    if(idx1 !== 0) tb = ((idx1 > 0 ? ix : ix + 1) - ox) * idx1;
+    if(idy1 !== 0) { const ty = ((idy1 > 0 ? iy : iy + 1) - oy) * idy1; if(ty > tb) { tb = ty; axis = 1; } }
+    if(idz1 !== 0) { const tz = ((idz1 > 0 ? iz : iz + 1) - oz) * idz1; if(tz > tb) { tb = tz; axis = 2; } }
+    st.axis = axis;
+    if(tb <= t0 + 1e-9) { st.t = t0; break; }
+    st.t = tb;
+    const nx = ix - (axis === 0 ? (idx1 > 0 ? 1 : -1) : 0);
+    const ny = iy - (axis === 1 ? (idy1 > 0 ? 1 : -1) : 0);
+    const nz = iz - (axis === 2 ? (idz1 > 0 ? 1 : -1) : 0);
+    if(!inBox(nx, ny, nz)) break;
+    if(voxAt(nx, ny, nz) === 0) break;
+    ix = nx; iy = ny; iz = nz;
+  }
+  st.vx = ix; st.vy = iy; st.vz = iz;
+};
+
+const clipBox = (ox, oy, oz, dx, dy, dz) => {
+  let t0 = 0, t1 = 1e9, a, b, q;
+  if(Math.abs(dx) < 1e-12) { if(ox < 0 || ox > N) return false; }
+  else { a = -ox / dx; b = (N - ox) / dx; if(a > b) { q = a; a = b; b = q; } if(a > t0) t0 = a; if(b < t1) t1 = b; }
+  if(Math.abs(dy) < 1e-12) { if(oy < 0 || oy > NY) return false; }
+  else { a = -oy / dy; b = (NY - oy) / dy; if(a > b) { q = a; a = b; b = q; } if(a > t0) t0 = a; if(b < t1) t1 = b; }
+  if(Math.abs(dz) < 1e-12) { if(oz < 0 || oz > N) return false; }
+  else { a = -oz / dz; b = (N - oz) / dz; if(a > b) { q = a; a = b; b = q; } if(a > t0) t0 = a; if(b < t1) t1 = b; }
+  if(t1 <= t0) return false;
+  st.clipT0 = t0 < 0 ? 0 : t0; st.clipT1 = t1;
+  return true;
+};
+
+const trace = (ox, oy, oz, dx, dy, dz, tMax, stopL = 0) => {
+  st.t = 0; st.type = 0;
+  if(!clipBox(ox, oy, oz, dx, dy, dz)) return false;
+  let t = st.clipT0;
+  let t1 = st.clipT1;
+  if(tMax < t1) t1 = tMax;
+  const idx1 = dx !== 0 ? 1 / dx : 0, idy1 = dy !== 0 ? 1 / dy : 0, idz1 = dz !== 0 ? 1 / dz : 0;
+  let L = LMAX;
+  for(let guard = 0; guard < 20000 && t < t1; guard++) {
+    const px = ox + dx * (t + EPS), py = oy + dy * (t + EPS), pz = oz + dz * (t + EPS);
+    if(px < 0 || py < 0 || pz < 0 || px >= N || py >= NY || pz >= N) break;
+    const ix = px | 0, iy = py | 0, iz = pz | 0;
+    let v = 0;
+    for(;;) {
+      if(L === 0) { v = voxAt(ix, iy, iz); break; }
+      v = L === CL ? (cellB[cellAt(ix, iy, iz)] !== -1 ? 1 : 0)
+        : lv[L][((iz >> L) * (NY >> L) + (iy >> L)) * (N >> L) + (ix >> L)];
+      if(v === 0 || L === stopL) break;
+      L = L === CL ? 0 : L - 1;
+    }
+    if(v === 0) {
+      t = Math.max(exitFast(ox, oy, oz, idx1, idy1, idz1, 1 << L, ix >> L, iy >> L, iz >> L), t) + EPS;
+      L = L === 0 ? CL : Math.min(LMAX, L + 1);
+      continue;
+    }
+    if(stopL > 0) { st.t = t; return true; }
+    st.t = t; st.vx = ix; st.vy = iy; st.vz = iz;
+    snapHit(ox, oy, oz, idx1, idy1, idz1, st.clipT0);
+    st.type = voxAt(st.vx, st.vy, st.vz);
+    const a = st.axis;
+    st.nx = a === 0 ? (dx > 0 ? -1 : 1) : 0;
+    st.ny = a === 1 ? (dy > 0 ? -1 : 1) : 0;
+    st.nz = a === 2 ? (dz > 0 ? -1 : 1) : 0;
+    return true;
+  }
+  return false;
+};
+
+// ─────────────────────────── PLAYER ───────────────────────────
+const P = { x: N / 2 + 0.5, y: NY - 2, z: N / 2 + 0.5, vy: 0, lag: 0, ex: 0, ey: 0, ez: 0, yaw: 0.6, pitch: -0.15, onGround: false, mat: 5 };
+
+const collides = (x, y, z) => {
+  const h = EYE + 0.18;
+  for(let dy = 0; dy <= h; dy += 0.45) {
+    const yy = y + Math.min(dy, h);
+    if(getVox(Math.floor(x - PLAYER_R), Math.floor(yy), Math.floor(z - PLAYER_R))) return true;
+    if(getVox(Math.floor(x + PLAYER_R), Math.floor(yy), Math.floor(z - PLAYER_R))) return true;
+    if(getVox(Math.floor(x - PLAYER_R), Math.floor(yy), Math.floor(z + PLAYER_R))) return true;
+    if(getVox(Math.floor(x + PLAYER_R), Math.floor(yy), Math.floor(z + PLAYER_R))) return true;
+  }
+  return false;
+};
+
+const keys = new Set();
+const movePlayer = (dt, inp) => {
+  const fx = inp ? inp.fx : (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+  const fz = inp ? inp.fz : (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
+  const yaw = inp ? inp.yaw : P.yaw;
+  const jump = inp ? inp.jump : keys.has('Space');
+  const sp = MOVE_SPEED * ((inp ? inp.sprint : keys.has('ShiftLeft')) ? 1.9 : 1);
+  const l = Math.hypot(fx, fz) || 1;
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const move = (fx || fz) ? sp : 0;
+  const vx = ((fz / l) * sy + (fx / l) * cy) * move;
+  const vz = ((fz / l) * cy - (fx / l) * sy) * move;
+  P.vy -= GRAVITY * dt;
+  if(jump && P.onGround) { P.vy = JUMP_V; P.onGround = false; }
+
+  const solid = (x, y, z) => getVox(Math.floor(x), Math.floor(y), Math.floor(z)) !== 0;
+  const nx = Math.max(-448 - wox, Math.min(448 - wox, P.x + vx * dt));
+  if(!solid(nx, P.y + STEP_H + 1, P.z) && !solid(nx, P.y + 15, P.z)) P.x = nx;
+  const nz = Math.max(-448 - woz, Math.min(448 - woz, P.z + vz * dt));
+  if(!solid(P.x, P.y + STEP_H + 1, nz) && !solid(P.x, P.y + 15, nz)) P.z = nz;
+
+  if(P.vy > 0) {
+    const ny = P.y + P.vy * dt;
+    if(solid(P.x, ny + 17, P.z)) P.vy = 0; else P.y = ny;
+    P.onGround = false;
+  } else {
+    let ground = -1;
+    for(let k = STEP_H; k >= -STEP_H; k--) {
+      const yy = P.y + k;
+      if(yy < 0) break;
+      if(solid(P.x, yy, P.z) && !solid(P.x, yy + 1, P.z)) { ground = Math.floor(yy) + 1; break; }
+    }
+    const ny = P.y + P.vy * dt;
+    if(ground >= 0 && ny <= ground) {
+      P.lag += ground - P.y;
+      P.y = ground;
+      P.vy = 0;
+      P.onGround = true;
+    } else {
+      P.y = ny;
+      P.onGround = false;
+    }
+  }
+  if(P.y < 1) { P.y = 1; P.vy = 0; P.onGround = true; }
+
+  P.lag -= Math.sign(P.lag) * Math.min(Math.abs(P.lag), Math.max(STEP_H * 2, Math.abs(P.lag) * 12) * dt);
+
+  followPlayer();
+};
+
+const followPlayer = () => {
+  const mid = N / 2, trip = CHUNK * 0.5;
+  while(P.x - mid > trip) { shiftWorld(CHUNK, 0); P.x -= CHUNK; }
+  while(mid - P.x > trip) { shiftWorld(-CHUNK, 0); P.x += CHUNK; }
+  while(P.z - mid > trip) { shiftWorld(0, CHUNK); P.z -= CHUNK; }
+  while(mid - P.z > trip) { shiftWorld(0, -CHUNK); P.z += CHUNK; }
+};
+
+// ─────────────────────────── RENDER ───────────────────────────
+const PYR_BASE = CL;
+const MAX_BLOCKS = 262144;
+const MAX_BODIES = 256;
+
+const net = {
+  ws: null, self: null, fresh: false, count: 0, seq: 0, ack: 0, inSeq: 0, bytes: 0, kbps: 0,
+  ticks: [],
+  seen: new Map(),
+  pending: [],
+  bodies: new Float32Array(MAX_BODIES * 4),
+};
+const BODY_KEEP = 700;
+
+const BULLET_SPEED = 1200;
+const TRACER_LEN = 40;
+const liveBullets = [];
+const spawnBullet = (shooter, x, y, z, dx, dy, dz) => {
+  const wall = trace(x, y, z, dx, dy, dz, 600) ? st.t : 600;
+  liveBullets.push({ x, y, z, dx, dy, dz, born: performance.now(), wall });
+  if(wall < 600) {
+    const dist = Math.hypot(x + dx * wall - P.x, y + dy * wall - P.y, z + dz * wall - P.z);
+    if(dist < 250) setTimeout(() => sfx.impact(dist), wall / BULLET_SPEED * 1000);
+  }
+};
+
+const craterLog = [];
+const addCrater = (x, y, z, r) => {
+  craterLog.push([x, y, z, r]);
+  sphereEdit(x - wox, y, z - woz, r, 0);
+  globalThis.craterCount = (globalThis.craterCount || 0) + 1;
+};
+let serverRun = 0;
+
+const reapplyCraters = (x0, z0, x1, z1) => {
+  for(const [x, y, z, r] of craterLog) {
+    const lx = x - wox, lz = z - woz;
+    if(lx >= x0 - r - 1 && lx < x1 + r + 1 && lz >= z0 - r - 1 && lz < z1 + r + 1) sphereEdit(lx, y, lz, r, 0);
+  }
+};
+
+// ─────────────────────────── SOUND ───────────────────────────
+const AC = new (window.AudioContext || window.webkitAudioContext)();
+addEventListener('mousedown', () => { if(AC.state !== 'running') AC.resume(); });
+const tone = (f0, f1, dur, vol, type) => {
+  const t = AC.currentTime;
+  const o = AC.createOscillator();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t);
+  o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  const g = AC.createGain();
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(AC.destination);
+  o.start(t);
+  o.stop(t + dur + 0.02);
+};
+const sfx = {
+  shot() {
+    const t = AC.currentTime;
+    const nb = AC.createBuffer(1, 6000, AC.sampleRate);
+    const d = nb.getChannelData(0);
+    for(let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / 700);
+    const src = AC.createBufferSource();
+    src.buffer = nb;
+    const f = AC.createBiquadFilter();
+    f.type = 'lowpass';
+    f.frequency.setValueAtTime(4500, t);
+    f.frequency.exponentialRampToValueAtTime(400, t + 0.14);
+    const g = AC.createGain();
+    g.gain.setValueAtTime(0.45, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
+    src.connect(f); f.connect(g); g.connect(AC.destination);
+    src.start(t);
+    tone(150, 45, 0.13, 0.5, 'triangle');
+  },
+  hit() { tone(1400, 950, 0.06, 0.22, 'square'); },
+  impact(dist) {
+    const vol = 0.9 / (1 + dist / 140);
+    if(vol < 0.02) return;
+    const t = AC.currentTime;
+    const nb = AC.createBuffer(1, 7000, AC.sampleRate);
+    const d = nb.getChannelData(0);
+    for(let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / 900);
+    const src = AC.createBufferSource();
+    src.buffer = nb;
+    const f = AC.createBiquadFilter();
+    f.type = 'lowpass';
+    f.frequency.setValueAtTime(2200, t);
+    f.frequency.exponentialRampToValueAtTime(300, t + 0.18);
+    const g = AC.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+    src.connect(f); f.connect(g); g.connect(AC.destination);
+    src.start(t);
+    tone(110, 40, 0.14, vol * 0.7, 'triangle');
+  },
+  kill() {
+    tone(520, 260, 0.22, 0.3, 'sawtooth');
+    setTimeout(() => tone(390, 195, 0.28, 0.28, 'sawtooth'), 90);
+  },
+};
+
+const hitFlash = () => {
+  const aim = document.getElementById('aim');
+  aim.style.borderColor = '#ff5040';
+  aim.style.transform = 'scale(1.8)';
+  setTimeout(() => { aim.style.borderColor = ''; aim.style.transform = ''; }, 120);
+};
+const INTERP_LAG = 60;
+
+// ─────────────────────────── LOBBY ───────────────────────────
+const ROOM = new URLSearchParams(location.search).get('room');
+const LOBBY = new URLSearchParams(location.search).get('lobby') || 'https://microcube.vseplet.deno.net';
+const ICE = ROOM ? { iceServers: [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  { urls: 'stun:global.stun.twilio.com:3478' },
+  { urls: 'stun:stun.nextcloud.com:443' },
+] } : {};
+const lobby = { id: null, host: null, role: null };
+const lobbyPost = (op, body) => fetch(`${LOBBY}/r/${ROOM}/${op}`, {
+  method: 'POST', body: JSON.stringify(body), signal: AbortSignal.timeout(4000),
+}).then((r) => r.json());
+const lobbyJoin = async () => {
+  let prev = null;
+  try { prev = sessionStorage.getItem('lobbyPrev'); } catch {}
+  lobby.id = (await lobbyPost('join', { prev })).id;
+  try { sessionStorage.setItem('lobbyPrev', lobby.id); } catch {}
+  const beat = await lobbyPost('beat', { id: lobby.id });
+  lobby.host = beat.host;
+  lobby.role = beat.host === lobby.id ? 'host' : 'guest';
+  setInterval(async () => {
+    try {
+      const b = await lobbyPost('beat', { id: lobby.id });
+      lobby.host = b.host;
+      const roleNow = b.host === lobby.id ? 'host' : 'guest';
+      if(roleNow !== lobby.role) {
+        console.warn(`lobby reload: роль ${lobby.role} → ${roleNow}`);
+        location.reload();
+      }
+    } catch {}
+  }, 2000);
+  return lobby.role;
+};
+
+const connect = async () => {
+  const pc = new RTCPeerConnection(ICE);
+  net.pc = pc;
+  const dc = pc.createDataChannel('game', { ordered: false, maxRetransmits: 0 });
+  dc.binaryType = 'arraybuffer';
+  const init = pc.createDataChannel('init');
+  init.binaryType = 'arraybuffer';
+  init.onmessage = (e) => {
+    const v = new DataView(e.data);
+    if(v.getUint8(0) !== 3) return;
+    const run = v.getUint32(1, true);
+    if(serverRun !== 0 && run !== serverRun) {
+      console.warn(`run reload: ${serverRun} → ${run}`);
+      location.reload();
+      return;
+    }
+    serverRun = run;
+    const n = v.getUint32(5, true);
+    for(let i = 0; i < n; i++) {
+      const o = 13 + i * 16;
+      addCrater(v.getFloat32(o, true), v.getFloat32(o + 4, true), v.getFloat32(o + 8, true), v.getFloat32(o + 12, true));
+    }
+  };
+  dc.onopen = () => {
+    net.seq = 0; net.ack = 0; net.inSeq = 0;
+    net.ticks.length = 0;
+    net.pending.length = 0;
+    net.seen.clear();
+    net.lastSnap = performance.now();
+    net.ws = dc;
+  };
+  dc.onclose = () => { net.ws = null; net.count = 0; setTimeout(connect, 1000); };
+  dc.onmessage = (e) => handleSnapshot(e.data);
+
+  await pc.setLocalDescription(await pc.createOffer());
+  await new Promise((ok) => {
+    if(pc.iceGatheringState === 'complete') return ok();
+    pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && ok();
+  });
+  try {
+    await lobbyPost('send', { to: lobby.host, from: lobby.id, kind: 'offer', sdp: pc.localDescription.sdp });
+    for(let tries = 0; tries < 20; tries++) {
+      const { mail } = await lobbyPost('recv', { id: lobby.id });
+      const ans = mail.find((mm) => mm.kind === 'answer');
+      if(ans) {
+        await pc.setRemoteDescription({ type: 'answer', sdp: ans.sdp });
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  } catch {}
+  try { pc.close(); } catch {}
+  setTimeout(connect, 2000);
+};
+
+const handleSnapshot = (data) => {
+  net.lastSnap = performance.now();
+  net.bytes += data.byteLength;
+  const v = new DataView(data);
+  if(v.getUint8(0) !== 2) return;
+  {
+    const seq = v.getUint32(1, true);
+    if(seq <= net.seq) return;
+    net.seq = seq;
+    net.ticks.push([seq, performance.now()]);
+    if(net.ticks.length > 16) net.ticks.shift();
+    net.ack = v.getUint32(5, true);
+    net.selfVy = v.getFloat32(9, true);
+    const n = Math.min(v.getUint16(13, true), MAX_BODIES);
+    const now = performance.now();
+    for(let i = 0; i < n; i++) {
+      const o = 15 + i * 18;
+      const id = v.getUint16(o, true);
+      const x = v.getFloat32(o + 2, true), y = v.getFloat32(o + 6, true), z = v.getFloat32(o + 10, true);
+      const yaw = v.getFloat32(o + 14, true);
+      if(id === 0) { net.self = { x, y, z, yaw }; net.fresh = true; continue; }
+      const b = net.seen.get(id);
+      if(b) { b.px = b.tx; b.py = b.ty; b.pz = b.tz; b.pt = b.tt; b.tx = x; b.ty = y; b.tz = z; b.tt = now; b.yaw = yaw; }
+      else net.seen.set(id, { px: x, py: y, pz: z, pt: now - 33, tx: x, ty: y, tz: z, tt: now, yaw });
+    }
+    let eo = 15 + n * 18;
+    const events = v.getUint16(eo, true);
+    eo += 2;
+    for(let i = 0; i < events; i++) {
+      const shooter = v.getUint16(eo, true);
+      const victim = v.getUint16(eo + 2, true);
+      eo += 4;
+      if(shooter === 0) { hitFlash(); sfx.hit(); sfx.kill(); }
+      const dead = net.seen.get(victim);
+      if(dead) net.seen.delete(victim);
+    }
+    const shots = v.getUint16(eo, true);
+    eo += 2;
+    for(let i = 0; i < shots; i++) {
+      const shooter = v.getUint16(eo, true);
+      const ox = v.getFloat32(eo + 2, true), oy = v.getFloat32(eo + 6, true), oz = v.getFloat32(eo + 10, true);
+      const dx = v.getFloat32(eo + 14, true), dy = v.getFloat32(eo + 18, true), dz = v.getFloat32(eo + 22, true);
+      eo += 26;
+      if(shooter === 0) continue;
+      spawnBullet(shooter, ox - wox, oy, oz - woz, dx, dy, dz);
+    }
+    const holes = v.getUint16(eo, true);
+    eo += 2;
+    for(let i = 0; i < holes; i++) {
+      const hx = v.getFloat32(eo, true), hy = v.getFloat32(eo + 4, true), hz = v.getFloat32(eo + 8, true), hr = v.getFloat32(eo + 12, true);
+      eo += 16;
+      const tc = performance.now();
+      addCrater(hx, hy, hz, hr);
+      perf.crater += performance.now() - tc;
+    }
+  }
+};
+if(!ROOM) net.ws = { readyState: 'open', send: () => {} };
+globalThis.hostInput = null;
+globalThis.net = net;
+globalThis.dbg = () => P;
+globalThis.dbgVox = (x, y, z) => getVox(Math.floor(x), Math.floor(y), Math.floor(z));
+
+const pyrOff = [];
+let pyrSize = 0;
+for(let L = 0; L <= LMAX; L++) {
+  pyrOff.push(L <= CL ? 0 : pyrSize);
+  if(L > CL) pyrSize += (N >> L) * (NY >> L) * (N >> L);
+}
+const pyrPack = new Uint8Array(Math.ceil(pyrSize / 4) * 4);
+
+const cv = document.getElementById('cv');
+const hud = document.getElementById('hud');
+let RW = 0, RH = 0;
+
+const gpu = await (async () => {
+  const adapter = await navigator.gpu?.requestAdapter();
+  if(!adapter) return null;
+  const device = await adapter.requestDevice({
+    requiredLimits: { maxStorageBufferBindingSize: Math.min(adapter.limits.maxStorageBufferBindingSize, MAX_BLOCKS * CELL3) },
+  });
+  const ctx = cv.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: 'opaque' });
+
+  const buf = (size, usage) => device.createBuffer({ size: Math.ceil(size / 4) * 4, usage });
+  const ST = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+  const uniBuf = buf(256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+  const cellBuf = buf(cellB.byteLength, ST);
+  const blockBuf = buf(MAX_BLOCKS * CELL3, ST);
+  const pyrBuf = buf(pyrPack.byteLength, ST);
+  const palBuf = buf(PAL.length * 16, ST);
+  const bodyBuf = buf(MAX_BODIES * 16, ST);
+  const tracerBuf = buf(64 * 32, ST);
+
+  const palData = new Float32Array(PAL.length * 4);
+  PAL.forEach((c, i) => { palData[i * 4] = c[0] / 255; palData[i * 4 + 1] = c[1] / 255; palData[i * 4 + 2] = c[2] / 255; });
+  device.queue.writeBuffer(palBuf, 0, palData);
+
+  const code = `
+const N = ${N};
+const NY = ${NY};
+const NC = ${NC};
+const NCY = ${NCY};
+const CL = ${CL}u;
+const CM = ${CM};
+const CELL = ${CELL};
+const CELL3 = ${CELL3}u;
+const MAX_BLOCKS = ${MAX_BLOCKS}u;
+const LMAX = ${LMAX}u;
+const PYR_BASE = ${PYR_BASE}u;
+const EPS = 1e-4;
+const PYR_OFF = array<u32, ${LMAX + 1}>(${pyrOff.map((o) => o + 'u').join(', ')});
+
+
+struct U {
+  origin: vec4<f32>,
+  right:  vec4<f32>,
+  up:     vec4<f32>,
+  fwd:    vec4<f32>,
+  sun:    vec4<f32>,
+  sunCol: vec4<f32>,
+  skyTop: vec4<f32>,
+  skyHor: vec4<f32>,
+  fogCol: vec4<f32>,
+  opts:   vec4<f32>,
+  misc:   vec4<f32>,
+  dof:    vec4<f32>,
+  opts2:  vec4<f32>,
+  arena:  vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> cells: array<i32>;
+@group(0) @binding(2) var<storage, read> blocks: array<u32>;
+@group(0) @binding(3) var<storage, read> pyr: array<u32>;
+@group(0) @binding(4) var<storage, read> pal: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> bodies: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> tracers: array<vec4<f32>>;
+
+fn tracerGlow(o: vec3<f32>, d: vec3<f32>, sceneT: f32) -> vec3<f32> {
+  var glow = vec3<f32>(0.0);
+  let cnt = u32(u.opts2.y);
+  for(var i = 0u; i < cnt; i++) {
+    let head = tracers[i * 2u].xyz;
+    let tail = tracers[i * 2u + 1u].xyz;
+    let seg = head - tail;
+    let segLen = length(seg);
+    if(segLen < 0.5) { continue; }
+    let sd = seg / segLen;
+    let w = o - tail;
+    let a = dot(d, d);
+    let bb = dot(d, sd);
+    let cc = dot(sd, sd);
+    let dd = dot(d, w);
+    let ee = dot(sd, w);
+    let den = a * cc - bb * bb;
+    var tRay = 0.0;
+    var tSeg = 0.0;
+    if(abs(den) > 1e-6) {
+      tRay = (bb * ee - cc * dd) / den;
+      tSeg = (a * ee - bb * dd) / den;
+    }
+    tSeg = clamp(tSeg, 0.0, segLen);
+    tRay = clamp(tRay, 0.0, sceneT);
+    let pRay = o + d * tRay;
+    let pSeg = tail + sd * tSeg;
+    let dist = length(pRay - pSeg);
+    let k = tSeg / segLen;
+    let core = exp(-dist * dist * 6.0);
+    let halo = exp(-dist * dist * 0.8) * 0.15;
+    glow += vec3<f32>(1.0, 0.85, 0.5) * (core + halo) * (0.2 + 0.8 * k);
+  }
+  return glow;
+}
+
+struct BodyHit { hit: bool, t: f32, n: vec3<f32>, col: vec3<f32> };
+
+fn hitBodies(o: vec3<f32>, d: vec3<f32>, maxT: f32) -> BodyHit {
+  var out: BodyHit;
+  out.hit = false;
+  out.t = maxT;
+  let count = u32(u.opts2.x);
+  let half = vec3<f32>(0.35, 0.9, 0.35) * ${SCALE}.0;
+  for(var i = 0u; i < count; i++) {
+    let b = bodies[i];
+    let c = b.xyz + vec3<f32>(0.0, half.y, 0.0);
+    let inv = 1.0 / d;
+    let t1 = (c - half - o) * inv;
+    let t2 = (c + half - o) * inv;
+    let lo = min(t1, t2);
+    let hi = max(t1, t2);
+    let tn = max(max(lo.x, lo.y), lo.z);
+    let tf = min(min(hi.x, hi.y), hi.z);
+    if(tf < tn || tf < 0.0 || tn > out.t) { continue; }
+    out.hit = true;
+    out.t = max(tn, 0.0);
+    let p = o + d * out.t - c;
+    let a = abs(p) / half;
+    if(a.x > a.y && a.x > a.z) { out.n = vec3<f32>(sign(p.x), 0.0, 0.0); }
+    else if(a.y > a.z) { out.n = vec3<f32>(0.0, sign(p.y), 0.0); }
+    else { out.n = vec3<f32>(0.0, 0.0, sign(p.z)); }
+    let hue = fract(b.w * 0.618034);
+    let rgb = clamp(abs(fract(vec3<f32>(hue) + vec3<f32>(0.0, 0.6667, 0.3333)) * 6.0 - 3.0) - 1.0, vec3<f32>(0.0), vec3<f32>(1.0));
+    out.col = mix(vec3<f32>(0.5), rgb, 0.65) * 0.9;
+  }
+  return out;
+}
+
+fn outside(p: vec3<i32>) -> bool {
+  return p.x < 0 || p.y < 0 || p.z < 0 || p.x >= N || p.y >= NY || p.z >= N;
+}
+
+fn cellIdx(p: vec3<i32>) -> i32 {
+  return ((p.z >> CL) * NCY + (p.y >> CL)) * NC + (p.x >> CL);
+}
+
+fn voxAt(p: vec3<i32>) -> u32 {
+  if(outside(p)) { return 0u; }
+  let b = cells[cellIdx(p)];
+  if(b == -1) { return 0u; }
+  if(b < -1) { return u32(-b - 2); }
+  if(u32(b) >= MAX_BLOCKS) { return 0u; }
+  let i = u32(b) * CELL3 + u32(((p.z & CM) * CELL + (p.y & CM)) * CELL + (p.x & CM));
+  return ((blocks[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu);
+}
+
+fn nodeAt(L: u32, p: vec3<i32>) -> u32 {
+  if(L == CL) { return select(1u, 0u, cells[cellIdx(p)] == -1); }
+  let nx = N >> L;
+  let ny = NY >> L;
+  let i = PYR_OFF[L] + u32(((p.z >> L) * ny + (p.y >> L)) * nx + (p.x >> L));
+  return (pyr[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+fn exitFast(o: vec3<f32>, inv: vec3<f32>, size: i32, node: vec3<i32>) -> vec2<f32> {
+  let b = vec3<f32>(node * size);
+  var t = vec3<f32>(1e30);
+  let far = b + vec3<f32>(f32(size));
+  if(inv.x > 0.0) { t.x = (far.x - o.x) * inv.x; } else if(inv.x < 0.0) { t.x = (b.x - o.x) * inv.x; }
+  if(inv.y > 0.0) { t.y = (far.y - o.y) * inv.y; } else if(inv.y < 0.0) { t.y = (b.y - o.y) * inv.y; }
+  if(inv.z > 0.0) { t.z = (far.z - o.z) * inv.z; } else if(inv.z < 0.0) { t.z = (b.z - o.z) * inv.z; }
+  var best = t.x; var axis = 0.0;
+  if(t.y < best) { best = t.y; axis = 1.0; }
+  if(t.z < best) { best = t.z; axis = 2.0; }
+  return vec2<f32>(best, axis);
+}
+
+fn clipBox(o: vec3<f32>, d: vec3<f32>) -> vec2<f32> {
+  var t0 = 0.0;
+  var t1 = 1e9;
+  let ext = vec3<f32>(f32(N), f32(NY), f32(N));
+  for(var k = 0u; k < 3u; k++) {
+    let oc = o[k]; let dc = d[k];
+    if(abs(dc) < 1e-12) {
+      if(oc < 0.0 || oc > ext[k]) { return vec2<f32>(1.0, 0.0); }
+    } else {
+      var a = -oc / dc; var b = (ext[k] - oc) / dc;
+      if(a > b) { let q = a; a = b; b = q; }
+      t0 = max(t0, a); t1 = min(t1, b);
+    }
+  }
+  return vec2<f32>(max(t0, 0.0), t1);
+}
+
+struct Hit { hit: bool, t: f32, v: vec3<i32>, axis: i32, kind: u32 };
+
+fn snapHit(o: vec3<f32>, inv: vec3<f32>, d: vec3<f32>, start: vec3<i32>, t0: f32) -> Hit {
+  var v = start;
+  var out: Hit;
+  out.hit = true; out.t = t0; out.v = v; out.axis = 0; out.kind = 0u;
+  for(var k = 0; k < 4; k++) {
+    var tb = -1e30; var axis = 0;
+    if(inv.x != 0.0) { tb = (f32(select(v.x + 1, v.x, inv.x > 0.0)) - o.x) * inv.x; }
+    if(inv.y != 0.0) { let ty = (f32(select(v.y + 1, v.y, inv.y > 0.0)) - o.y) * inv.y; if(ty > tb) { tb = ty; axis = 1; } }
+    if(inv.z != 0.0) { let tz = (f32(select(v.z + 1, v.z, inv.z > 0.0)) - o.z) * inv.z; if(tz > tb) { tb = tz; axis = 2; } }
+    out.axis = axis;
+    if(tb <= t0 + 1e-9) { out.t = t0; break; }
+    out.t = tb;
+    var n = v;
+    if(axis == 0) { n.x = v.x - select(-1, 1, inv.x > 0.0); }
+    else if(axis == 1) { n.y = v.y - select(-1, 1, inv.y > 0.0); }
+    else { n.z = v.z - select(-1, 1, inv.z > 0.0); }
+    if(outside(n)) { break; }
+    if(voxAt(n) == 0u) { break; }
+    v = n;
+  }
+  out.v = v;
+  return out;
+}
+
+fn trace(o: vec3<f32>, d: vec3<f32>, tMax: f32, stopL: u32) -> Hit {
+  var out: Hit;
+  out.hit = false; out.t = 0.0; out.v = vec3<i32>(0); out.axis = 0; out.kind = 0u;
+  let clip = clipBox(o, d);
+  if(clip.y <= clip.x) { return out; }
+  var t = clip.x;
+  let t1 = min(clip.y, tMax);
+  let inv = vec3<f32>(
+    select(0.0, 1.0 / d.x, d.x != 0.0),
+    select(0.0, 1.0 / d.y, d.y != 0.0),
+    select(0.0, 1.0 / d.z, d.z != 0.0));
+  var L = LMAX;
+  var axis = 0.0;
+  for(var guard = 0; guard < 4096 && t < t1; guard++) {
+    let eps = max(EPS, t * 1e-5);
+    let p = o + d * (t + eps);
+    if(any(p < vec3<f32>(0.0)) || any(p >= vec3<f32>(f32(N), f32(NY), f32(N)))) { break; }
+    let ip = vec3<i32>(p);
+    var v = 0u;
+    loop {
+      if(L == 0u) { v = voxAt(ip); break; }
+      v = nodeAt(L, ip);
+      if(v == 0u || L == stopL) { break; }
+      L = select(L - 1u, 0u, L == PYR_BASE);
+    }
+    if(v == 0u) {
+      let e = exitFast(o, inv, i32(1u << L), ip >> vec3<u32>(L));
+      t = max(e.x, t) + eps;
+      axis = e.y;
+      L = select(min(LMAX, L + 1u), PYR_BASE, L == 0u);
+      continue;
+    }
+    if(stopL > 0u) { out.hit = true; out.t = t; return out; }
+    var h = snapHit(o, inv, d, ip, clip.x);
+    h.kind = voxAt(h.v);
+    return h;
+  }
+  return out;
+}
+
+fn occAt(p: vec3<i32>) -> f32 { return select(0.0, 1.0, voxAt(p) != 0u); }
+fn vAO(s1: f32, s2: f32, c: f32) -> f32 { return select(3.0 - (s1 + s2 + c), 0.0, s1 > 0.0 && s2 > 0.0); }
+
+fn voxAO(pos: vec3<f32>, n: vec3<f32>) -> f32 {
+  let v = vec3<i32>(floor(pos - n * 0.5));
+  let b = v + vec3<i32>(n);
+  var uu: vec3<i32>; var ww: vec3<i32>; var f: vec2<f32>;
+  let fp = pos - vec3<f32>(v);
+  if(n.x != 0.0) { uu = vec3<i32>(0, 1, 0); ww = vec3<i32>(0, 0, 1); f = vec2<f32>(fp.y, fp.z); }
+  else if(n.y != 0.0) { uu = vec3<i32>(1, 0, 0); ww = vec3<i32>(0, 0, 1); f = vec2<f32>(fp.x, fp.z); }
+  else { uu = vec3<i32>(1, 0, 0); ww = vec3<i32>(0, 1, 0); f = vec2<f32>(fp.x, fp.y); }
+  let sum = occAt(b - uu); let sup = occAt(b + uu);
+  let svm = occAt(b - ww); let svp = occAt(b + ww);
+  let a00 = vAO(sum, svm, occAt(b - uu - ww));
+  let a10 = vAO(sup, svm, occAt(b + uu - ww));
+  let a01 = vAO(sum, svp, occAt(b - uu + ww));
+  let a11 = vAO(sup, svp, occAt(b + uu + ww));
+  let ao = ((a00 * (1.0 - f.x) + a10 * f.x) * (1.0 - f.y) + (a01 * (1.0 - f.x) + a11 * f.x) * f.y) / 3.0;
+  return 1.0 - (1.0 - ao) * u.sun.w;
+}
+
+fn sky(d: vec3<f32>) -> vec3<f32> {
+  let k = clamp(d.y * 1.6 + 0.15, 0.0, 1.0);
+  var c = mix(u.skyHor.rgb, u.skyTop.rgb, k);
+  c = mix(c, u.fogCol.rgb, max(0.0, 1.0 - abs(d.y) * 6.0));
+  let sd = dot(d, u.sun.xyz);
+  let disc = select(0.0, 1.0, sd > u.sunCol.w);
+  let glow = pow(max(0.0, (sd - u.skyTop.w) / (1.0 - u.skyTop.w)), 4.0);
+  return mix(c, u.sunCol.rgb, min(1.0, disc + glow));
+}
+
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  return vec4<f32>(p[i], 0.0, 1.0);
+}
+
+fn shade(d: vec3<f32>) -> vec4<f32> {
+  let o = u.origin.xyz;
+  let maxD = u.up.w;
+
+  let h = trace(o, d, maxD, 0u);
+  let bh = hitBodies(o, d, select(maxD, h.t, h.hit));
+  if(bh.hit) {
+    let lam = max(0.0, dot(bh.n, u.sun.xyz));
+    let k = u.fwd.w + (1.0 - u.fwd.w) * lam;
+    let fog = clamp((bh.t - u.skyHor.w) / (u.fogCol.w - u.skyHor.w), 0.0, 1.0);
+    return vec4<f32>(mix(bh.col * k, u.fogCol.rgb, fog), bh.t);
+  }
+  if(!h.hit) { return vec4<f32>(sky(d) + border(o, d, maxD), maxD); }
+
+  var n = vec3<f32>(0.0);
+  if(h.axis == 0) { n.x = select(1.0, -1.0, d.x > 0.0); }
+  else if(h.axis == 1) { n.y = select(1.0, -1.0, d.y > 0.0); }
+  else { n.z = select(1.0, -1.0, d.z > 0.0); }
+
+  let pos = o + d * h.t;
+  let lam = max(0.0, dot(n, u.sun.xyz));
+  var k = u.fwd.w + (1.0 - u.fwd.w) * lam;
+  k *= select(select(select(0.9, 0.82, n.x != 0.0), 0.62, n.y < 0.0), 1.0, n.y > 0.0);
+  if(u.opts.x > 0.5) { k *= voxAO(pos, n); }
+  if(u.opts.y > 0.5 && lam > 0.0) {
+    let sh = trace(pos + n * 0.03, u.sun.xyz, u.opts.z, u32(u.misc.x));
+    if(sh.hit) { k *= u.opts.w; }
+  }
+  var col = pal[h.kind].rgb * k;
+  let fog = clamp((h.t - u.skyHor.w) / (u.fogCol.w - u.skyHor.w), 0.0, 1.0);
+  return vec4<f32>(mix(col, u.fogCol.rgb, fog) + border(o, d, h.t), h.t);
+}
+
+fn border(o: vec3<f32>, d: vec3<f32>, sceneT: f32) -> vec3<f32> {
+  var glow = 0.0;
+  for(var k = 0u; k < 4u; k++) {
+    var plane = u.arena.x;
+    if(k == 1u) { plane = u.arena.y; }
+    var t = 0.0;
+    if(k < 2u) {
+      if(abs(d.x) < 1e-5) { continue; }
+      t = (plane - o.x) / d.x;
+    } else {
+      plane = select(u.arena.w, u.arena.z, k == 2u);
+      if(abs(d.z) < 1e-5) { continue; }
+      t = (plane - o.z) / d.z;
+    }
+    if(t < 0.5 || t > sceneT) { continue; }
+    let p = o + d * t;
+    if(p.y < 0.0 || p.y > 200.0) { continue; }
+    if(k < 2u) { if(p.z < u.arena.z || p.z > u.arena.w) { continue; } }
+    else { if(p.x < u.arena.x || p.x > u.arena.y) { continue; } }
+    let stripe = smoothstep(0.8, 1.0, abs(fract(p.y / 24.0) * 2.0 - 1.0));
+    glow += (0.08 + 0.25 * stripe) * exp(-p.y * 0.004);
+  }
+  return vec3<f32>(1.0, 0.45, 0.4) * glow;
+}
+
+@fragment fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+  let fov = u.origin.w;
+  let uu = (2.0 * frag.x / u.misc.y - 1.0) * fov * u.right.w;
+  let vv = (1.0 - 2.0 * frag.y / u.misc.z) * fov;
+  return shade(normalize(u.right.xyz * uu + u.up.xyz * vv + u.fwd.xyz));
+}
+
+@group(0) @binding(1) var frame: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+@fragment fn fsBlur(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+  let res = vec2<f32>(u.misc.y, u.misc.z);
+  let uv = frag.xy / res;
+  let here = textureSampleLevel(frame, samp, uv, 0.0);
+  let k = clamp((here.a - u.dof.x) / max(1.0, u.dof.y - u.dof.x), 0.0, 1.0);
+  let r = k * k * u.dof.z;
+  var col = here.rgb;
+  if(r >= 0.4) {
+    var sum = here.rgb;
+    var wsum = 1.0;
+    for(var i = 0u; i < 8u; i++) {
+      let a = (f32(i) + 0.5) * 0.7853982;
+      let dir = vec2<f32>(cos(a), sin(a));
+      for(var ring = 1u; ring <= 2u; ring++) {
+        let off = dir * r * (0.5 * f32(ring));
+        let s = textureSampleLevel(frame, samp, uv + off / res, 0.0);
+        let w = select(0.0, 1.0, s.a > here.a - r);
+        sum += s.rgb * w;
+        wsum += w;
+      }
+    }
+    col = sum / wsum;
+  }
+  let fov = u.origin.w;
+  let uu = (2.0 * frag.x / u.misc.y - 1.0) * fov * u.right.w;
+  let vv = (1.0 - 2.0 * frag.y / u.misc.z) * fov;
+  let d = normalize(u.right.xyz * uu + u.up.xyz * vv + u.fwd.xyz);
+  col += tracerGlow(u.origin.xyz, d, here.a);
+  return vec4<f32>(col, 1.0);
+}
+`;
+
+  const module = device.createShaderModule({ code });
+  const SCENE = 'rgba16float';
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module, entryPoint: 'vs' },
+    fragment: { module, entryPoint: 'fs', targets: [{ format: SCENE }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const blurPipe = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module, entryPoint: 'vs' },
+    fragment: { module, entryPoint: 'fsBlur', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+  const bind = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniBuf } },
+      { binding: 1, resource: { buffer: cellBuf } },
+      { binding: 2, resource: { buffer: blockBuf } },
+      { binding: 3, resource: { buffer: pyrBuf } },
+      { binding: 4, resource: { buffer: palBuf } },
+      { binding: 5, resource: { buffer: bodyBuf } },
+    ],
+  });
+  return { device, ctx, pipeline, blurPipe, sampler, bind, uniBuf, cellBuf, blockBuf, pyrBuf, bodyBuf, tracerBuf, format, SCENE };
+})();
+
+let sceneTex = null, blurBind = null;
+
+const resize = () => {
+  RH = RES_H;
+  RW = Math.max(1, Math.round(RH * (innerWidth / innerHeight)));
+  cv.width = RW; cv.height = RH;
+  if(!gpu) return;
+  sceneTex?.destroy();
+  sceneTex = gpu.device.createTexture({
+    size: [RW, RH],
+    format: gpu.SCENE,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+  });
+  blurBind = gpu.device.createBindGroup({
+    layout: gpu.blurPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: gpu.uniBuf } },
+      { binding: 1, resource: sceneTex.createView() },
+      { binding: 2, resource: gpu.sampler },
+      { binding: 6, resource: { buffer: gpu.tracerBuf } },
+    ],
+  });
+};
+
+const uni = new Float32Array(56);
+
+const upload = () => {
+  compact();
+  const q = gpu.device.queue;
+  for(const b of dirtyBlocks) {
+    if(b >= MAX_BLOCKS) { if(!upload.warned) { upload.warned = true; console.warn('block pool overflow: raise MAX_BLOCKS'); } continue; }
+    q.writeBuffer(gpu.blockBuf, b * CELL3, blocks, b * CELL3, CELL3);
+  }
+  dirtyBlocks.clear();
+  if(dirtyCells) { q.writeBuffer(gpu.cellBuf, 0, cellB); dirtyCells = false; }
+  if(dirtyPyr) {
+    for(let L = CL + 1; L <= LMAX; L++) pyrPack.set(lv[L], pyrOff[L]);
+    q.writeBuffer(gpu.pyrBuf, 0, pyrPack);
+    dirtyPyr = false;
+  }
+};
+
+const render = () => {
+  if(!gpu) return;
+  const fov = Math.tan(FOV_DEG * Math.PI / 360);
+  const cy = Math.cos(P.yaw), sy = Math.sin(P.yaw), cp = Math.cos(P.pitch), sp = Math.sin(P.pitch);
+  const sl = Math.hypot(SUN[0], SUN[1], SUN[2]);
+  uni.set([P.x + P.ex, P.y + P.ey + EYE - P.lag, P.z + P.ez, fov], 0);
+  uni.set([cy, 0, -sy, RW / RH], 4);
+  uni.set([-sp * sy, cp, -sp * cy, MAX_DIST], 8);
+  uni.set([cp * sy, sp, cp * cy, AMBIENT], 12);
+  uni.set([SUN[0] / sl, SUN[1] / sl, SUN[2] / sl, AO_STRENGTH], 16);
+  uni.set([SUN_COLOR[0] / 255, SUN_COLOR[1] / 255, SUN_COLOR[2] / 255, SUN_COS], 20);
+  uni.set([SKY_TOP[0] / 255, SKY_TOP[1] / 255, SKY_TOP[2] / 255, SUN_GLOW], 24);
+  uni.set([SKY_HOR[0] / 255, SKY_HOR[1] / 255, SKY_HOR[2] / 255, MAX_DIST * FOG_START], 28);
+  uni.set([FOG.color.r / 255, FOG.color.g / 255, FOG.color.b / 255, MAX_DIST * FOG_END], 32);
+  uni.set([AO ? 1 : 0, SHADOW ? 1 : 0, SHADOW_DIST, SHADOW_DARK], 36);
+  uni.set([SHADOW_LOD > 0 ? PYR_BASE : 0, RW, RH, 0], 40);
+  uni.set([MAX_DIST * DOF_START, MAX_DIST * DOF_END, DOF_R, 0], 44);
+  const now = performance.now() - INTERP_LAG;
+  let w = 0;
+  for(const [id, b] of net.seen) {
+    if(now - b.tt > BODY_KEEP) { net.seen.delete(id); continue; }
+    const span = Math.max(1, b.tt - b.pt);
+    const k = Math.max(0, Math.min(1.6, (now - b.pt) / span));
+    net.bodies.set([
+      b.px + (b.tx - b.px) * k - wox,
+      b.py + (b.ty - b.py) * k,
+      b.pz + (b.tz - b.pz) * k - woz,
+      id,
+    ], w * 4);
+    if(++w >= MAX_BODIES) break;
+  }
+  net.count = w;
+  if(w) gpu.device.queue.writeBuffer(gpu.bodyBuf, 0, net.bodies, 0, w * 4);
+
+  const tnow = performance.now();
+  let tc = 0;
+  const tr = new Float32Array(64 * 8);
+  for(let i = liveBullets.length - 1; i >= 0; i--) {
+    const b = liveBullets[i];
+    const flew = (tnow - b.born) / 1000 * BULLET_SPEED;
+    if(flew - TRACER_LEN > b.wall || flew > 700) { liveBullets.splice(i, 1); continue; }
+    const headT = Math.min(flew, b.wall);
+    const tailT = Math.max(0, flew - TRACER_LEN);
+    if(tc < 64) {
+      tr.set([b.x + b.dx * headT, b.y + b.dy * headT, b.z + b.dz * headT, 0,
+              b.x + b.dx * tailT, b.y + b.dy * tailT, b.z + b.dz * tailT, 0], tc * 8);
+      tc++;
+    }
+  }
+  if(tc) gpu.device.queue.writeBuffer(gpu.tracerBuf, 0, tr, 0, tc * 8);
+  uni.set([net.count, tc, 0, 0], 48);
+  uni.set([-448 - wox, 448 - wox, -448 - woz, 448 - woz], 52);
+  gpu.device.queue.writeBuffer(gpu.uniBuf, 0, uni);
+
+  upload();
+
+  const enc = gpu.device.createCommandEncoder();
+  const draw = (pipe, bind, view) => {
+    const pass = enc.beginRenderPass({
+      colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+    });
+    pass.setPipeline(pipe);
+    pass.setBindGroup(0, bind);
+    pass.draw(3);
+    pass.end();
+  };
+  draw(gpu.pipeline, gpu.bind, sceneTex.createView());
+  draw(gpu.blurPipe, blurBind, gpu.ctx.getCurrentTexture().createView());
+  gpu.device.queue.submit([enc.finish()]);
+};
+
+(async () => {
+  addEventListener('keydown', (e) => {
+    keys.add(e.code);
+    if(e.code === 'Space') e.preventDefault();
+    const n = e.code.startsWith('Digit') ? Number(e.code.slice(5)) : 0;
+    if(n >= 1 && n <= MATS) P.mat = n - 1;
+  });
+  addEventListener('keyup', (e) => keys.delete(e.code));
+  cv.addEventListener('click', () => { if(document.pointerLockElement !== cv) cv.requestPointerLock(); });
+  addEventListener('mousemove', (e) => {
+    if(document.pointerLockElement !== cv) return;
+    P.yaw += e.movementX * MOUSE_SENS;
+    P.pitch = Math.max(-1.5, Math.min(1.5, P.pitch - e.movementY * MOUSE_SENS));
+  });
+  addEventListener('contextmenu', (e) => e.preventDefault());
+  addEventListener('resize', resize);
+
+  const hud = document.getElementById('hud');
+
+  const REDUN = 3;
+  const inBuf = new ArrayBuffer(2 + REDUN * 28);
+  const inView = new DataView(inBuf);
+  inView.setUint8(0, 1);
+  const sentRing = [];
+  let shoot = 0, dig = 0;
+  addEventListener('mousedown', (e) => {
+    if(document.pointerLockElement !== cv) return;
+    if(e.button === 2) dig = 1; else shoot = 1;
+  });
+  const sendInput = (dt) => {
+    if(!net.ws || net.ws.readyState !== 'open') return null;
+    let aim = net.seq - 4;
+    const shown = performance.now() - INTERP_LAG;
+    for(let i = net.ticks.length - 1; i > 0; i--) {
+      const [tB, atB] = net.ticks[i], [tA, atA] = net.ticks[i - 1];
+      if(shown >= atA && shown <= atB) { aim = tA + (tB - tA) * (shown - atA) / (atB - atA); break; }
+    }
+    const inp = {
+      seq: ++net.inSeq,
+      dt,
+      fx: (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0),
+      fz: (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0),
+      yaw: P.yaw,
+      pitch: P.pitch,
+      jump: keys.has('Space'),
+      buttons: shoot + (keys.has('Space') ? 2 : 0) + (keys.has('ShiftLeft') ? 4 : 0) + dig * 8,
+      sprint: keys.has('ShiftLeft'),
+      aim,
+    };
+    if(shoot) {
+      const cp = Math.cos(inp.pitch), spp = Math.sin(inp.pitch);
+      const vx = cp * Math.sin(inp.yaw), vy = spp, vz = cp * Math.cos(inp.yaw);
+      const ex = P.x, ey = P.y + EYE, ez = P.z;
+      const tAim = trace(ex, ey, ez, vx, vy, vz, 600) ? st.t : 600;
+      const mx = ex + Math.cos(inp.yaw) * 2.5, my = ey - 3, mz = ez - Math.sin(inp.yaw) * 2.5;
+      const dx = ex + vx * tAim - mx, dy = ey + vy * tAim - my, dz = ez + vz * tAim - mz;
+      const l = Math.hypot(dx, dy, dz) || 1;
+      spawnBullet(0, mx, my, mz, dx / l, dy / l, dz / l);
+      sfx.shot();
+    }
+    shoot = 0;
+    dig = 0;
+    sentRing.push(inp);
+    if(sentRing.length > REDUN) sentRing.shift();
+    inView.setUint8(1, sentRing.length);
+    for(let k = 0; k < sentRing.length; k++) {
+      const s = sentRing[k], o = 2 + k * 28;
+      inView.setUint32(o, s.seq, true);
+      inView.setFloat32(o + 4, s.fx, true);
+      inView.setFloat32(o + 8, s.fz, true);
+      inView.setFloat32(o + 12, s.yaw, true);
+      inView.setFloat32(o + 16, s.buttons, true);
+      inView.setFloat32(o + 20, s.pitch, true);
+      inView.setFloat32(o + 24, s.aim, true);
+    }
+    net.ws.send(inBuf);
+    globalThis.hostInput = inp;
+    if(inp.buttons & 1) globalThis.hostFire = 1;
+    if(inp.buttons & 8) globalThis.hostDig = 1;
+    return inp;
+  };
+
+  let last = performance.now(), fps = 0, hudT = 0, renderMs = 0;
+  const frame = (now) => {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if(dt > 0) fps = fps ? fps * 0.9 + 0.1 / dt : 1 / dt;
+    const inp = sendInput(dt);
+    if(inp) net.pending.push(inp);
+    movePlayer(dt, inp);
+
+    if(net.fresh) {
+      net.fresh = false;
+      net.pending = net.pending.filter((i) => i.seq > net.ack);
+      const was = { x: P.x, y: P.y, z: P.z };
+      P.x = net.self.x - wox;
+      P.y = net.self.y;
+      P.z = net.self.z - woz;
+      P.vy = net.selfVy;
+      P.onGround = net.selfVy < 5 && collides(P.x, P.y - 0.5, P.z);
+      for(const old of net.pending) movePlayer(old.dt, old);
+      const ex = was.x - P.x, ey = was.y - P.y, ez = was.z - P.z;
+      if(Math.hypot(ex, ey, ez) < SCALE * 2) { P.ex += ex; P.ey += ey; P.ez += ez; }
+      followPlayer();
+    }
+    const soak = Math.exp(-dt * 14);
+    P.ex *= soak; P.ey *= soak; P.ez *= soak;
+    pumpPending(LOAD_BUDGET_MS);
+    const t0 = performance.now();
+    render();
+    renderMs = renderMs * 0.9 + (performance.now() - t0) * 0.1;
+    if(now - hudT > 250) {
+      hudT = now;
+      hud.textContent =
+        `${RW}×${RH} · ${(RW * RH)} rays · world ${N}×${NY}×${N} · ${fps |0 } fps · frame ${renderMs.toFixed(1)} ms\n` +
+        `voxels ${(((blockCount - freeB.length) * CELL3 + cellB.byteLength) / 1048576).toFixed(1)} MB · pyramid ${(pyrBytes / 1048576).toFixed(1)} MB\n` +
+        `${net.ws ? 'online' : 'offline'} · players from server ${net.count} · rx ${net.kbps.toFixed(0)} KB/s\n`;
+      net.kbps = net.kbps * 0.5 + (net.bytes / 256) * 0.5;
+      net.bytes = 0;
+    }
+    requestAnimationFrame(frame);
+  };
+
+  const knobs = {
+    get RES_H() { return RES_H; }, set RES_H(v) { RES_H = v; },
+    get DIG_R() { return DIG_R; }, set DIG_R(v) { DIG_R = v; },
+    get DOF_START() { return DOF_START; }, set DOF_START(v) { DOF_START = v; },
+    get DOF_END() { return DOF_END; }, set DOF_END(v) { DOF_END = v; },
+    get DOF_R() { return DOF_R; }, set DOF_R(v) { DOF_R = v; },
+    get FOG_START() { return FOG_START; }, set FOG_START(v) { FOG_START = v; },
+    get FOG_END() { return FOG_END; }, set FOG_END(v) { FOG_END = v; },
+    get FOV_DEG() { return FOV_DEG; }, set FOV_DEG(v) { FOV_DEG = v; },
+    get MAX_DIST() { return MAX_DIST; }, set MAX_DIST(v) { MAX_DIST = v; },
+    get SHADOW() { return SHADOW; }, set SHADOW(v) { SHADOW = v; },
+    get SHADOW_DIST() { return SHADOW_DIST; }, set SHADOW_DIST(v) { SHADOW_DIST = v; },
+    get SHADOW_DARK() { return SHADOW_DARK; }, set SHADOW_DARK(v) { SHADOW_DARK = v; },
+    get SHADOW_LOD() { return SHADOW_LOD; }, set SHADOW_LOD(v) { SHADOW_LOD = v; },
+  };
+  const pane = new Pane({ container: document.getElementById('panel'), title: 'MicroCube' });
+  pane.addBinding(knobs, 'RES_H', { label: 'resolution', min: 60, max: 2160, step: 20 }).on('change', resize);
+  pane.addBinding(knobs, 'FOV_DEG', { label: 'fov', min: 40, max: 110, step: 1 });
+  pane.addBinding(knobs, 'MAX_DIST', { label: 'far', min: 40, max: N / 2, step: 10 });
+  pane.addBinding(knobs, 'SHADOW', { label: 'shadows' });
+  pane.addBinding(knobs, 'SHADOW_DIST', { label: 'shadow far', min: 8, max: N / 2, step: 8 });
+  pane.addBinding(knobs, 'SHADOW_DARK', { label: 'shadow dark', min: 0.1, max: 1, step: 0.05 });
+  pane.addBinding(knobs, 'SHADOW_LOD', { label: 'shadow lod', min: 0, max: 4, step: 1 });
+  pane.addBinding(knobs, 'DIG_R', { label: 'dig radius', min: 1, max: 40, step: 1 });
+  pane.addBinding(knobs, 'DOF_R', { label: 'blur radius', min: 0, max: 12, step: 0.5 });
+  pane.addBinding(knobs, 'DOF_START', { label: 'blur start', min: 0, max: 1, step: 0.01 });
+  pane.addBinding(knobs, 'DOF_END', { label: 'blur end', min: 0, max: 1, step: 0.01 });
+  pane.addBinding(knobs, 'FOG_START', { label: 'fog start', min: 0, max: 1, step: 0.01 });
+  pane.addBinding(knobs, 'FOG_END', { label: 'fog end', min: 0, max: 1, step: 0.01 });
+  pane.addBinding(FOG, 'color', { label: 'fog colour' });
+  pane.addButton({ title: '@vseplet' }).on('click', () => open('https://x.com/vseplet', '_blank'));
+
+  const loadBox = document.getElementById('load');
+  const loadText = document.getElementById('loadText');
+  const loadBar = document.querySelector('#bar > i');
+  const step = (label, done) => {
+    loadText.textContent = label;
+    loadBar.style.width = `${Math.round(done * 100)}%`;
+    return new Promise(requestAnimationFrame);
+  };
+
+  resize();
+  const t0 = performance.now();
+  for(let z = 0; z < N; z++) {
+    for(let x = 0; x < N; x++) genColumn(x, z);
+    if((z & 31) === 31) await step(`generating world · ${(z + 1) / 10.24 | 0}%`, (z + 1) / N * 0.9);
+  }
+  await step('building pyramid', 0.94);
+  reduceBox(0, 0, 0, N - 1, NY - 1, N - 1);
+  reapplyCraters(0, 0, N, N);
+  await step('uploading to gpu', 0.98);
+  render();
+  console.log(`world ready in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+  loadBox.classList.add('done');
+  requestAnimationFrame(frame);
+})();
+
+// ─────────────────────────── HOST ───────────────────────────
+(async () => {
+  const el = document.createElement('div');
+  el.style.cssText = 'position:fixed;left:8px;bottom:8px;font:12px/1.4 monospace;white-space:pre;color:#ffd27f;text-shadow:0 0 3px #000,0 0 3px #000;pointer-events:none';
+  document.body.appendChild(el);
+  if(ROOM) {
+    try {
+      const role = await lobbyJoin();
+      if(role === 'guest') {
+        el.textContent = `guest of ${lobby.host} · room ${ROOM}`;
+        connect();
+        setInterval(() => {
+          if(net.ws && performance.now() - net.lastSnap > 2500) {
+            try { net.pc.close(); } catch {}
+            net.ws = null;
+            connect();
+          }
+        }, 1000);
+        return;
+      }
+      el.textContent = `host · room ${ROOM}`;
+      net.ws = { readyState: 'open', send: () => {} };
+    } catch (e) {
+      el.textContent = 'лобби недоступно: ' + e;
+      return;
+    }
+  }
+  const adapter = await navigator.gpu?.requestAdapter();
+  if(!adapter) { el.textContent = 'host: no webgpu'; return; }
+  const device = await adapter.requestDevice({ requiredLimits: {
+    maxStorageBufferBindingSize: Math.min(adapter.limits.maxStorageBufferBindingSize, 64 << 20),
+  } });
+  device.addEventListener('uncapturederror', (e) => console.error('host gpu:', e.error.message));
+  const src = await fetch('server/src/tick.wgsl', { cache: 'no-store' }).then((r) => r.text());
+  const module = device.createShaderModule({ code: src });
+  for(const m of (await module.getCompilationInfo()).messages) {
+    if(m.type === 'error') { el.textContent = 'host: wgsl ' + m.message; return; }
+  }
+
+  const HIST = 64, MAX_VIS = 255, TICKRATE = 30, WORLD = 1024, MAX_CELLS = 1024;
+  const BULLET_SPEED = 1200, BULLET_LIFE = 0.5 * TICKRATE;
+  let NP = +(new URLSearchParams(location.search).get('n') || 256);
+
+  const BINDS = ['cfg', 'players', 'inputs', 'hist', 'visCount', 'visList', 'hitCount', 'hits',
+    'cellOf', 'cellAnchor', 'cellVis', 'bullets', 'craterReq', 'world', 'world'];
+  const USED = {
+    gen_world: [13],
+    move_players: [0, 1, 2, 3, 8, 13],
+    visibility: [0, 1, 4, 5, 13],
+    fly_bullets: [0, 1, 3, 6, 7, 11, 12, 13],
+    cell_visibility: [0, 9, 10, 13],
+    carve_craters: [6, 12, 14],
+  };
+  const pipes = {}, layouts = {};
+  for(const [e, ids] of Object.entries(USED)) {
+    layouts[e] = device.createBindGroupLayout({
+      entries: ids.map((i) => ({
+        binding: i,
+        visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: i === 0 ? 'uniform' : (i === 2 || i === 9) ? 'read-only-storage' : 'storage' },
+      })),
+    });
+    pipes[e] = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [layouts[e]] }),
+      compute: { module, entryPoint: e },
+    });
+  }
+
+  let gen = 0, bufs = null;
+  const stats = { tick: 0, sim: [], read: [], cells: [], total: [], snap: [] };
+  globalThis.host = { stats, setPlayers: (n) => { NP = n; boot(); } };
+
+  const guests = new Map();
+  let nextSlot = 1;
+  const slotPool = [];
+  let hostTx = 0;
+  const conns = new Set();
+  const pendingPcs = [];
+  setInterval(() => {
+    for(let i = pendingPcs.length - 1; i >= 0; i--) {
+      const p = pendingPcs[i];
+      if(p.opened) { pendingPcs.splice(i, 1); continue; }
+      if(performance.now() - p.born > 15000) {
+        try { p.pc.close(); } catch {}
+        conns.delete(p.pc);
+        pendingPcs.splice(i, 1);
+      }
+    }
+  }, 5000);
+  const hostCraterLog = [];
+  const hostRunId = (Math.random() * 4294967296) >>> 0;
+  const sendJournal = (ch) => {
+    let i = 0;
+    do {
+      const chunk = hostCraterLog.slice(i, i + 3000);
+      const dv = new DataView(new ArrayBuffer(13 + chunk.length * 16));
+      dv.setUint8(0, 3);
+      dv.setUint32(1, hostRunId, true);
+      dv.setUint32(5, chunk.length, true);
+      dv.setUint32(9, stats.tick, true);
+      chunk.forEach((c, k) => { for(let f = 0; f < 4; f++) dv.setFloat32(13 + k * 16 + f * 4, c[f], true); });
+      ch.send(dv.buffer);
+      i += 3000;
+    } while(i < hostCraterLog.length);
+  };
+  const wireGuest = (ch, pc) => {
+    const slot = slotPool.length ? slotPool.pop() : nextSlot++;
+    if(slot >= NP) { pc.close(); return; }
+    const g = { dc: ch, pc, input: new Float32Array(6), seq: 0, lastIn: performance.now() };
+    guests.set(slot, g);
+    const r = 60 + (slot % 23) * 18, a = slot * 0.7;
+    if(bufs) device.queue.writeBuffer(bufs.players, slot * 32,
+      new Float32Array([Math.cos(a) * r, 200, Math.sin(a) * r, 0, 0, 0, 0, 1]));
+    ch.onmessage = (e) => {
+      g.lastIn = performance.now();
+      const v = new DataView(e.data);
+      if(v.getUint8(0) !== 1) return;
+      const count = v.getUint8(1);
+      for(let m = 0; m < count; m++) {
+        const o = 2 + m * 28;
+        const seq = v.getUint32(o, true);
+        if(seq <= g.seq) continue;
+        g.seq = seq;
+        for(let f = 0; f < 6; f++) g.input[f] = v.getFloat32(o + 4 + f * 4, true);
+        if((g.input[3] | 0) & 1) g.fire = 1;
+      }
+    };
+    ch.onclose = () => {
+      try { pc.close(); } catch {}
+      conns.delete(pc);
+      guests.delete(slot);
+      slotPool.push(slot);
+      if(bufs) device.queue.writeBuffer(bufs.players, slot * 32 + 28, new Float32Array([0]));
+    };
+  };
+  const pollSignal = async () => {
+    try {
+      const want = +(await fetch('http://127.0.0.1:9098/want', { signal: AbortSignal.timeout(5000) }).then((r) => r.text()));
+      if(want > 0) {
+        const batch = Math.min(want, 8);
+        const pcs = [], offers = [];
+        for(let k = 0; k < batch; k++) {
+          const pc = new RTCPeerConnection();
+          pendingPcs.push({ pc, born: performance.now(), opened: false });
+          const entry = pendingPcs[pendingPcs.length - 1];
+          conns.add(pc);
+          pc.onconnectionstatechange = () => {
+            if(['closed', 'failed', 'disconnected'].includes(pc.connectionState)) {
+              try { pc.close(); } catch {}
+              conns.delete(pc);
+            }
+          };
+          const dc = pc.createDataChannel('game', { ordered: false, maxRetransmits: 0 });
+          dc.binaryType = 'arraybuffer';
+          const init = pc.createDataChannel('init');
+          init.binaryType = 'arraybuffer';
+          let gameG = null, gameSlot = -1, journalSent = false;
+          const enter = () => {
+            if(journalSent && gameG) guests.set(gameSlot, gameG);
+          };
+          init.onopen = () => {
+            let i = 0;
+            do {
+              const chunk = hostCraterLog.slice(i, i + 3000);
+              const dv = new DataView(new ArrayBuffer(13 + chunk.length * 16));
+              dv.setUint8(0, 3);
+              dv.setUint32(1, hostRunId, true);
+              dv.setUint32(5, chunk.length, true);
+              dv.setUint32(9, stats.tick, true);
+              chunk.forEach((c, k) => { for(let f = 0; f < 4; f++) dv.setFloat32(13 + k * 16 + f * 4, c[f], true); });
+              init.send(dv.buffer);
+              i += 3000;
+            } while(i < hostCraterLog.length);
+            journalSent = true;
+            enter();
+          };
+          dc.onopen = () => {
+            entry.opened = true;
+            const slot = slotPool.length ? slotPool.pop() : nextSlot++;
+            if(slot >= NP) { pc.close(); return; }
+            const g = { dc, pc, input: new Float32Array(6), seq: 0, lastIn: performance.now() };
+            gameG = g; gameSlot = slot;
+            enter();
+            const r = 60 + (slot % 23) * 18, a = slot * 0.7;
+            if(bufs) device.queue.writeBuffer(bufs.players, slot * 32,
+              new Float32Array([Math.cos(a) * r, 200, Math.sin(a) * r, 0, 0, 0, 0, 1]));
+            dc.onmessage = (e) => {
+              g.lastIn = performance.now();
+              const v = new DataView(e.data);
+              if(v.getUint8(0) !== 1) return;
+              const count = v.getUint8(1);
+              for(let m = 0; m < count; m++) {
+                const o = 2 + m * 28;
+                const seq = v.getUint32(o, true);
+                if(seq <= g.seq) continue;
+                g.seq = seq;
+                for(let f = 0; f < 6; f++) g.input[f] = v.getFloat32(o + 4 + f * 4, true);
+                if((g.input[3] | 0) & 1) g.fire = 1;
+              }
+            };
+            dc.onclose = () => {
+              try { pc.close(); } catch {}
+              conns.delete(pc);
+              guests.delete(slot);
+              slotPool.push(slot);
+              if(bufs) device.queue.writeBuffer(bufs.players, slot * 32 + 28, new Float32Array([0]));
+            };
+          };
+          await pc.setLocalDescription(await pc.createOffer());
+          await new Promise((ok) => {
+            if(pc.iceGatheringState === 'complete') return ok();
+            pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && ok();
+          });
+          pcs.push(pc);
+          offers.push(btoa(pc.localDescription.sdp));
+        }
+        const reply = await fetch('http://127.0.0.1:9098/offers', { method: 'POST', body: offers.join('\n'), signal: AbortSignal.timeout(15000) })
+          .then((r) => r.text());
+        const lines = reply.split('\n').filter(Boolean);
+        for(let k = 0; k < lines.length; k++) {
+          const [, b64] = lines[k].split(' ');
+          if(b64) await pcs[k].setRemoteDescription({ type: 'answer', sdp: atob(b64) });
+        }
+      }
+    } catch (e) { if(!(e instanceof TypeError)) console.warn('host signal:', e); }
+    setTimeout(pollSignal, 1000);
+  };
+  pollSignal();
+
+  if(ROOM) {
+    const acceptGuest = async (from, sdp) => {
+      const pc = new RTCPeerConnection(ICE);
+      conns.add(pc);
+      pc.onconnectionstatechange = () => {
+        if(['closed', 'failed', 'disconnected'].includes(pc.connectionState)) {
+          try { pc.close(); } catch {}
+          conns.delete(pc);
+        }
+      };
+      pc.ondatachannel = (ev) => {
+        const ch = ev.channel;
+        ch.binaryType = 'arraybuffer';
+        if(ch.label === 'init') {
+          if(ch.readyState === 'open') sendJournal(ch);
+          else ch.onopen = () => sendJournal(ch);
+          return;
+        }
+        if(ch.label === 'game') wireGuest(ch, pc);
+      };
+      await pc.setRemoteDescription({ type: 'offer', sdp });
+      await pc.setLocalDescription(await pc.createAnswer());
+      await new Promise((ok) => {
+        if(pc.iceGatheringState === 'complete') return ok();
+        pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && ok();
+      });
+      await lobbyPost('send', { to: from, from: lobby.id, kind: 'answer', sdp: pc.localDescription.sdp });
+    };
+    setInterval(async () => {
+      try {
+        const { mail } = await lobbyPost('recv', { id: lobby.id });
+        for(const mm of mail) if(mm.kind === 'offer') acceptGuest(mm.from, mm.sdp).catch(() => {});
+      } catch {}
+    }, 1000);
+  }
+
+  const boot = async () => {
+    const my = ++gen;
+    if(bufs) for(const b of Object.values(bufs)) b.destroy();
+    const B = (size, usage) => device.createBuffer({ size: Math.ceil(size / 4) * 4, usage });
+    const ST = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+    const SRC = ST | GPUBufferUsage.COPY_SRC;
+    const maxBullets = Math.max(256, NP);
+    bufs = {
+      cfg: B(32, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST),
+      players: B(NP * 32, SRC),
+      inputs: B(NP * 32, ST),
+      hist: B(HIST * NP * 16, ST),
+      visCount: B(NP * 4, ST),
+      visList: B(NP * MAX_VIS * 4, ST),
+      hitCount: B(8, SRC),
+      hits: B(4096 * 16, SRC),
+      cellOf: B(NP * 4, SRC),
+      cellAnchor: B(MAX_CELLS * 16, ST),
+      cellVis: B(MAX_CELLS * MAX_CELLS * 4, ST),
+      bullets: B(maxBullets * 32, ST),
+      craterReq: B(64 * 16, SRC),
+      world: B(WORLD * WORLD * 8 * 4, ST),
+      stPlayers: B(NP * 32, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST),
+      stCellOf: B(NP * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST),
+      stHit: B(8, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST),
+      stHits: B(256 * 16, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST),
+      stCraters: B(64 * 16, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST),
+    };
+    const groups = {};
+    for(const [e, ids] of Object.entries(USED)) {
+      groups[e] = device.createBindGroup({
+        layout: layouts[e],
+        entries: ids.map((i) => ({ binding: i, resource: { buffer: bufs[BINDS[i]] } })),
+      });
+    }
+
+    const ps = new Float32Array(NP * 8);
+    ps[0] = 30; ps[1] = 200; ps[2] = 30; ps[7] = 1;
+    device.queue.writeBuffer(bufs.players, 0, ps);
+
+    const cfgBuf = new ArrayBuffer(32);
+    const cu = new Uint32Array(cfgBuf), cf = new Float32Array(cfgBuf);
+    const writeCfg = (tick, cells) => {
+      cu[0] = NP; cu[1] = HIST; cu[2] = tick; cu[3] = MAX_VIS;
+      cf[4] = 1 / TICKRATE; cf[5] = 430; cu[6] = cells; cf[7] = 0;
+      device.queue.writeBuffer(bufs.cfg, 0, cfgBuf);
+    };
+
+    writeCfg(0, 1);
+    {
+      const e = device.createCommandEncoder();
+      const p = e.beginComputePass();
+      p.setPipeline(pipes.gen_world); p.setBindGroup(0, groups.gen_world);
+      p.dispatchWorkgroups(WORLD * WORLD / 64);
+      p.end();
+      device.queue.submit([e.finish()]);
+      const t0 = performance.now();
+      await device.queue.onSubmittedWorkDone();
+      console.log(`host: world in ${(performance.now() - t0).toFixed(1)} ms`);
+    }
+
+    const inputs = new Float32Array(NP * 8);
+    const zeroVis = new Uint32Array(NP);
+    const zeroHit = new Uint32Array(2);
+    let lastPlayers = ps.slice();
+    let cells = 1, tick = 0, slot = 0;
+    stats.tick = 0; stats.sim.length = stats.read.length = stats.cells.length = stats.total.length = 0;
+
+    const step = async () => {
+      const tA = performance.now();
+      inputs.fill(0);
+      for(let i = 0; i < NP; i++) inputs[i * 8 + 5] = tick;
+      const nowMs = performance.now();
+      for(const [slot, g] of guests) {
+        if(nowMs - g.lastIn > 3000) {
+          try { g.dc.close(); } catch {}
+          try { g.pc.close(); } catch {}
+          conns.delete(g.pc);
+          guests.delete(slot);
+          slotPool.push(slot);
+          device.queue.writeBuffer(bufs.players, slot * 32 + 28, new Float32Array([0]));
+        }
+      }
+      for(const [slot, g] of guests) {
+        if(slot >= NP) continue;
+        inputs[slot * 8] = g.input[0]; inputs[slot * 8 + 1] = g.input[1];
+        inputs[slot * 8 + 2] = g.input[2];
+        inputs[slot * 8 + 3] = (g.input[3] | 0) & 6;
+        inputs[slot * 8 + 4] = g.input[4];
+        inputs[slot * 8 + 5] = tick;
+      }
+      const shotEvents = [];
+      let ackSeq = 0;
+      const hi = globalThis.hostInput;
+      if(hi) {
+        ackSeq = hi.seq;
+        inputs[0] = hi.fx; inputs[1] = hi.fz; inputs[2] = hi.yaw;
+        inputs[3] = hi.buttons & 6; inputs[4] = hi.pitch; inputs[5] = tick;
+        if(globalThis.hostFire) {
+          globalThis.hostFire = 0;
+          const cp = Math.cos(hi.pitch);
+          const d = [cp * Math.sin(hi.yaw), Math.sin(hi.pitch), cp * Math.cos(hi.yaw)];
+          const delay = hi.aim > 0 ? Math.max(0, Math.min(15, Math.round(tick - hi.aim))) : 2;
+          const b = new Float32Array([
+            lastPlayers[0], lastPlayers[1] + 16, lastPlayers[2], delay * 1024,
+            d[0] * BULLET_SPEED, d[1] * BULLET_SPEED, d[2] * BULLET_SPEED, BULLET_LIFE,
+          ]);
+          device.queue.writeBuffer(bufs.bullets, slot * 32, b);
+          slot = (slot + 1) % Math.max(256, NP);
+          shotEvents.push([0, b[0], b[1], b[2], d[0], d[1], d[2]]);
+        }
+      }
+      device.queue.writeBuffer(bufs.inputs, 0, inputs);
+      device.queue.writeBuffer(bufs.visCount, 0, zeroVis);
+      let digCount = 0;
+      if(hi && globalThis.hostDig) {
+        globalThis.hostDig = 0;
+        const cp = Math.cos(hi.pitch);
+        const d = [cp * Math.sin(hi.yaw), Math.sin(hi.pitch), cp * Math.cos(hi.yaw)];
+        if(trace(P.x, P.y + EYE, P.z, d[0], d[1], d[2], 120)) {
+          const t = st.t;
+          device.queue.writeBuffer(bufs.craterReq, 0, new Float32Array([
+            P.x + d[0] * t + wox, P.y + EYE + d[1] * t, P.z + d[2] * t + woz, 15,
+          ]));
+          digCount = 1;
+        }
+      }
+      device.queue.writeBuffer(bufs.hitCount, 0, new Uint32Array([0, digCount]));
+      writeCfg(tick, cells);
+      const maxBullets = Math.max(256, NP);
+      for(const [gslot, g] of guests) {
+        if(gslot >= NP || !g.fire) continue;
+        g.fire = 0;
+        const yaw = g.input[2], pitch = g.input[4], cp = Math.cos(pitch);
+        const d = [cp * Math.sin(yaw), Math.sin(pitch), cp * Math.cos(yaw)];
+        const gd = g.input[5] > 0 ? Math.max(0, Math.min(15, Math.round(tick - g.input[5]))) : 2;
+        const b = new Float32Array([
+          lastPlayers[gslot * 8], lastPlayers[gslot * 8 + 1] + 16, lastPlayers[gslot * 8 + 2], gslot + gd * 1024,
+          d[0] * BULLET_SPEED, d[1] * BULLET_SPEED, d[2] * BULLET_SPEED, BULLET_LIFE,
+        ]);
+        device.queue.writeBuffer(bufs.bullets, slot * 32, b);
+        slot = (slot + 1) % maxBullets;
+        shotEvents.push([gslot, b[0], b[1], b[2], d[0], d[1], d[2]]);
+      }
+
+      const e = device.createCommandEncoder();
+      const p = e.beginComputePass();
+      p.setPipeline(pipes.move_players); p.setBindGroup(0, groups.move_players);
+      p.dispatchWorkgroups(Math.ceil(NP / 64));
+      const g = Math.ceil(NP / 8);
+      p.setPipeline(pipes.visibility); p.setBindGroup(0, groups.visibility);
+      p.dispatchWorkgroups(g, g);
+      p.setPipeline(pipes.fly_bullets); p.setBindGroup(0, groups.fly_bullets);
+      p.dispatchWorkgroups(maxBullets / 64);
+      p.setPipeline(pipes.carve_craters); p.setBindGroup(0, groups.carve_craters);
+      p.dispatchWorkgroups(16, 64);
+      p.end();
+      e.copyBufferToBuffer(bufs.players, 0, bufs.stPlayers, 0, NP * 32);
+      e.copyBufferToBuffer(bufs.cellOf, 0, bufs.stCellOf, 0, NP * 4);
+      e.copyBufferToBuffer(bufs.hitCount, 0, bufs.stHit, 0, 8);
+      e.copyBufferToBuffer(bufs.hits, 0, bufs.stHits, 0, 256 * 16);
+      e.copyBufferToBuffer(bufs.craterReq, 0, bufs.stCraters, 0, 64 * 16);
+      device.queue.submit([e.finish()]);
+
+      await Promise.all([
+        bufs.stPlayers.mapAsync(GPUMapMode.READ), bufs.stCellOf.mapAsync(GPUMapMode.READ),
+        bufs.stHit.mapAsync(GPUMapMode.READ), bufs.stHits.mapAsync(GPUMapMode.READ),
+        bufs.stCraters.mapAsync(GPUMapMode.READ),
+      ]);
+      if(my !== gen) return;
+      const tB = performance.now();
+      lastPlayers = new Float32Array(bufs.stPlayers.getMappedRange()).slice();
+      const cellOf = new Uint32Array(bufs.stCellOf.getMappedRange()).slice();
+      const hitU = new Uint32Array(bufs.stHit.getMappedRange()).slice();
+      const hitsRaw = new Uint32Array(bufs.stHits.getMappedRange()).slice();
+      const cratersRaw = new Float32Array(bufs.stCraters.getMappedRange()).slice();
+      bufs.stPlayers.unmap(); bufs.stCellOf.unmap();
+      bufs.stHit.unmap(); bufs.stHits.unmap(); bufs.stCraters.unmap();
+
+      const craterEvents = [];
+      for(let i = 0; i < Math.min(hitU[1], 64); i++) {
+        const c = [cratersRaw[i * 4], cratersRaw[i * 4 + 1], cratersRaw[i * 4 + 2], cratersRaw[i * 4 + 3]];
+        craterEvents.push(c);
+        hostCraterLog.push(c);
+      }
+      const killEvents = [];
+      const deadNow = new Set();
+      for(let i = 0; i < Math.min(hitU[0], 256); i++) {
+        const shooter = hitsRaw[i * 4], victim = hitsRaw[i * 4 + 1];
+        if(victim >= NP || deadNow.has(victim)) continue;
+        deadNow.add(victim);
+        if(victim !== 0 && !guests.has(victim)) continue;
+        const r1 = ((tick * 2654435761 + victim * 40503) % 400) - 200;
+        const r2 = ((tick * 40503 + victim * 2654435761) % 400) - 200;
+        device.queue.writeBuffer(bufs.players, victim * 32,
+          new Float32Array([r1, 220, r2, 0, 0, 0, 0, 1]));
+        killEvents.push([shooter, victim]);
+      }
+
+      const uniq = new Map(), anchors = new Float32Array(MAX_CELLS * 4);
+      for(let i = 0; i < NP; i++) {
+        if(lastPlayers[i * 8 + 7] < 0.5) continue;
+        let at = uniq.get(cellOf[i]);
+        if(at === undefined) { at = uniq.size; uniq.set(cellOf[i], at); }
+        anchors[at * 4] += lastPlayers[i * 8];
+        anchors[at * 4 + 1] += lastPlayers[i * 8 + 1];
+        anchors[at * 4 + 2] += lastPlayers[i * 8 + 2];
+        anchors[at * 4 + 3] += 1;
+      }
+      cells = uniq.size;
+      for(let a = 0; a < cells; a++) {
+        const k = 1 / Math.max(1, anchors[a * 4 + 3]);
+        anchors[a * 4] *= k; anchors[a * 4 + 1] *= k; anchors[a * 4 + 2] *= k;
+      }
+      device.queue.writeBuffer(bufs.cellAnchor, 0, anchors, 0, cells * 4);
+      writeCfg(tick, cells);
+      const tC = performance.now();
+
+      const e2 = device.createCommandEncoder();
+      const p2 = e2.beginComputePass();
+      p2.setPipeline(pipes.cell_visibility);
+      p2.setBindGroup(0, groups.cell_visibility);
+      const gc = Math.ceil(cells / 8);
+      p2.dispatchWorkgroups(gc, gc);
+      p2.end();
+      device.queue.submit([e2.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      if(my !== gen) return;
+      const tD = performance.now();
+
+      const tS = performance.now();
+      const R2 = 430 * 430;
+      {
+        const mx = lastPlayers[0], mz = lastPlayers[2];
+        const near = [];
+        for(let i = 1; i < NP && near.length < 128; i++) {
+          if(lastPlayers[i * 8 + 7] < 0.5) continue;
+          const dx = lastPlayers[i * 8] - mx, dz = lastPlayers[i * 8 + 2] - mz;
+          if(dx * dx + dz * dz < R2) near.push(i);
+        }
+        const out = new DataView(new ArrayBuffer(
+          15 + (near.length + 1) * 18 + 6 + killEvents.length * 4
+          + shotEvents.length * 26 + craterEvents.length * 16));
+        out.setUint8(0, 2);
+        out.setUint32(1, tick, true);
+        out.setUint32(5, ackSeq, true);
+        out.setFloat32(9, lastPlayers[5], true);
+        out.setUint16(13, near.length + 1, true);
+        let o = 15;
+        for(const i of [0, ...near]) {
+          out.setUint16(o, i, true);
+          out.setFloat32(o + 2, lastPlayers[i * 8], true);
+          out.setFloat32(o + 6, lastPlayers[i * 8 + 1], true);
+          out.setFloat32(o + 10, lastPlayers[i * 8 + 2], true);
+          out.setFloat32(o + 14, lastPlayers[i * 8 + 3], true);
+          o += 18;
+        }
+        out.setUint16(o, killEvents.length, true); o += 2;
+        for(const [s, vv] of killEvents) {
+          out.setUint16(o, s, true); out.setUint16(o + 2, vv, true); o += 4;
+        }
+        out.setUint16(o, shotEvents.length, true); o += 2;
+        for(const s of shotEvents) {
+          out.setUint16(o, s[0], true);
+          for(let f = 1; f < 7; f++) out.setFloat32(o + 2 + (f - 1) * 4, s[f], true);
+          o += 26;
+        }
+        out.setUint16(o, craterEvents.length, true); o += 2;
+        for(const c of craterEvents) {
+          for(let f = 0; f < 4; f++) out.setFloat32(o + f * 4, c[f], true);
+          o += 16;
+        }
+        handleSnapshot(out.buffer);
+      }
+      for(const [slot, g] of guests) {
+        if(g.dc.readyState !== 'open' || g.dc.bufferedAmount > 65536 || slot >= NP) continue;
+        const mx = lastPlayers[slot * 8], mz = lastPlayers[slot * 8 + 2];
+        const lx = Math.sin(g.input[2]), lz = Math.cos(g.input[2]);
+        const near = [slot];
+        for(let i = 0; i < NP && near.length < 128; i++) {
+          if(i === slot || lastPlayers[i * 8 + 7] < 0.5) continue;
+          const dx = lastPlayers[i * 8] - mx, dz = lastPlayers[i * 8 + 2] - mz;
+          const d2 = dx * dx + dz * dz;
+          if(d2 >= R2) continue;
+          const d = Math.sqrt(d2);
+          const inCone = (dx * lx + dz * lz) / Math.max(1, d) > -0.34;
+          let div = d < 150 ? 1 : d < 300 ? 2 : 3;
+          if(!inCone) div *= 3;
+          if((tick + i) % div === 0) near.push(i);
+        }
+        const out = new DataView(new ArrayBuffer(
+          15 + near.length * 18 + 6 + killEvents.length * 4
+          + shotEvents.length * 26 + craterEvents.length * 16));
+        out.setUint8(0, 2);
+        out.setUint32(1, tick, true);
+        out.setUint32(5, g.seq, true);
+        out.setFloat32(9, lastPlayers[slot * 8 + 5], true);
+        out.setUint16(13, near.length, true);
+        const remap = (i) => i === slot ? 0 : (i === 0 ? 999 : i);
+        let o = 15;
+        for(const i of near) {
+          out.setUint16(o, remap(i), true);
+          out.setFloat32(o + 2, lastPlayers[i * 8], true);
+          out.setFloat32(o + 6, lastPlayers[i * 8 + 1], true);
+          out.setFloat32(o + 10, lastPlayers[i * 8 + 2], true);
+          out.setFloat32(o + 14, lastPlayers[i * 8 + 3], true);
+          o += 18;
+        }
+        out.setUint16(o, killEvents.length, true); o += 2;
+        for(const [s, vv] of killEvents) {
+          out.setUint16(o, remap(s), true); out.setUint16(o + 2, remap(vv), true); o += 4;
+        }
+        out.setUint16(o, shotEvents.length, true); o += 2;
+        for(const s of shotEvents) {
+          out.setUint16(o, remap(s[0]), true);
+          for(let f = 1; f < 7; f++) out.setFloat32(o + 2 + (f - 1) * 4, s[f], true);
+          o += 26;
+        }
+        out.setUint16(o, craterEvents.length, true); o += 2;
+        for(const c of craterEvents) {
+          for(let f = 0; f < 4; f++) out.setFloat32(o + f * 4, c[f], true);
+          o += 16;
+        }
+        g.dc.send(out.buffer);
+        hostTx += out.buffer.byteLength;
+      }
+      stats.snap.push(performance.now() - tS);
+      if(stats.snap.length > 300) stats.snap.shift();
+
+      stats.sim.push(tB - tA); stats.cells.push(tD - tC); stats.read.push(tC - tB);
+      stats.total.push(tD - tA);
+      if(stats.total.length > 300) { stats.sim.shift(); stats.cells.shift(); stats.read.shift(); stats.total.shift(); }
+      stats.tick = ++tick;
+
+      if(tick % 15 === 0) {
+        const q = (a, f) => { const v = [...a].sort((x, y) => x - y); return v[(v.length * f) | 0].toFixed(1); };
+        el.textContent = `host · ${NP} players · ${guests.size} guests · conns ${conns.size} · cells ${cells}\n` +
+          `tick ${q(stats.total, 0.5)}/${q(stats.total, 0.99)} ms (med/p99)\n` +
+          `sim ${q(stats.sim, 0.5)} · readback ${q(stats.read, 0.5)} · cellvis ${q(stats.cells, 0.5)} · snap ${q(stats.snap, 0.5)}\n` +
+          `tx ${(hostTx * 2 / 1024) | 0} KB/s`;
+        hostTx = 0;
+      }
+      if(my === gen) setTimeout(step, Math.max(0, 1000 / TICKRATE - (performance.now() - tA)));
+    };
+    step();
+  };
+  boot();
+})();
+</script>
+</body>
+</html>
