@@ -1085,6 +1085,28 @@ const connect = async () => {
     await lobbyPost('send', { to: lobby.host, from: lobby.id, kind: 'knock', sdp: knockPos });
     for(let tries = 0; tries < 20; tries++) {
       const { mail } = await lobbyPost('recv', { id: lobby.id });
+      if(mail.some((mm) => mm.kind === 'sendoffer')) {
+        const dc = pc.createDataChannel('game', { ordered: false, maxRetransmits: 0 });
+        dc.binaryType = 'arraybuffer';
+        wireGame(dc);
+        const init = pc.createDataChannel('init');
+        init.binaryType = 'arraybuffer';
+        wireInit(init);
+        await pc.setLocalDescription(await pc.createOffer());
+        await new Promise((ok) => {
+          if(pc.iceGatheringState === 'complete') return ok();
+          pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && ok();
+        });
+        await lobbyPost('send', { to: lobby.host, from: lobby.id, kind: 'offer', sdp: pc.localDescription.sdp });
+        for(let w = 0; w < 30; w++) {
+          const { mail: m2 } = await lobbyPost('recv', { id: lobby.id });
+          const ans = m2.find((mm) => mm.kind === 'answer');
+          if(ans) await pc.setRemoteDescription({ type: 'answer', sdp: ans.sdp });
+          if(net.ws) return;
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        break;
+      }
       const off = mail.find((mm) => mm.kind === 'offer');
       if(off) {
         await pc.setRemoteDescription({ type: 'offer', sdp: off.sdp });
