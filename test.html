@@ -71,6 +71,15 @@ struct Hit {
 @group(0) @binding(12) var<storage, read_write> craterReq: array<vec4<f32>>;
 @group(0) @binding(13) var<storage, read_write> world: array<u32>;
 @group(0) @binding(14) var<storage, read_write> worldBits: array<atomic<u32>>;
+@group(0) @binding(15) var<uniform> genP: GenP;
+@group(0) @binding(16) var<storage, read_write> genOut: array<u32>;
+
+struct GenP {
+  wx0: f32,
+  wz0: f32,
+  colsX: u32,
+  cols: u32,
+};
 
 const BULLET_R = 3.5;
 
@@ -358,6 +367,58 @@ fn carve_craters(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAnd(&worldBits[col + u32(y >> 5)], ~(1u << u32(y & 31)));
   }
 }
+
+@compute @workgroup_size(64)
+fn gen_types(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let c = gid.x;
+  if(c >= genP.cols) { return; }
+  let wx = genP.wx0 + f32(c % genP.colsX);
+  let wz = genP.wz0 + f32(c / genP.colsX);
+  let h = heightAt(wx, wz);
+  let lvl = (h - GROUND + HILLS) / (2.0 * HILLS)
+    + (vnoise(wx / (6.0 * SCALE), wz / (6.0 * SCALE), 31) - 0.5) * 0.28;
+  let mSurf = clamp(i32(lvl * 14.0), 0, 13);
+  let bandBase = vnoise(wx / (40.0 * SCALE), wz / (40.0 * SCALE), 21) * 6.0;
+  let deepBand = vnoise(f32(i32(wx) >> 3) / 3.0, f32(i32(wz) >> 3) / 3.0, 21) * 6.0;
+  let bx = i32(floor(wx));
+  let bz = i32(floor(wz));
+  var isle = 0.0;
+  var isleTop = false;
+  var word = 0u;
+  for(var y = 0; y < 256; y++) {
+    let fy = f32(y);
+    var t = 0;
+    if(fy >= h) {
+      isle = isleAt(wx, fy, wz);
+      isleTop = isle > ISLE_AMOUNT && isleAt(wx, fy + 1.0, wz) <= ISLE_AMOUNT;
+    }
+    if(fy < h || isle > ISLE_AMOUNT) {
+      var depthB = 2;
+      if(fy < h) { depthB = i32(h - 1.0 - fy); }
+      else if(isleTop) { depthB = 0; }
+      let deep = fy < h - 3.0;
+      var m = 0;
+      if(depthB == 0) { m = mSurf; }
+      else if(depthB == 1) { m = max(0, mSurf - 1); }
+      else {
+        let band = select(bandBase + fy / (2.5 * SCALE), deepBand + f32(y >> 3), deep);
+        m = ((i32(floor(band)) % 14) + 14) % 14;
+      }
+      let baseM = 1 + m * 3;
+      if(deep) {
+        t = baseM + 1;
+      } else {
+        t = baseM + i32(hash2(bx * 7 + y, bz * 13 + y, 5) * 3.0);
+        if(hash2(i32(wx * 3.0), i32(wz * 5.0), y) > 0.82) { t = baseM + (t - baseM + 1) % 3; }
+      }
+    }
+    word |= u32(t) << ((u32(y) & 3u) * 8u);
+    if((y & 3) == 3) {
+      genOut[c * 64u + u32(y >> 2)] = word;
+      word = 0u;
+    }
+  }
+}
 </script>
 <script type="module">
 import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js';
@@ -370,14 +431,7 @@ const N = 1024;
 const NY = 256;
 const CELL = 8;
 const CHUNK = 32;
-const BLOCK = 1;
-const GROUND = M(9);
-const HILLS = M(4);
-const ISLE_Y = M(17);
-const ISLE_SIZE = M(6);
-const ISLE_AMOUNT = 0.7;
 const LOAD_BUDGET_MS = 3;
-const SEED = 7;
 
 const MOVE_SPEED = M(4.5);
 const RUN_MULT = 1.9;
@@ -523,23 +577,6 @@ const sphereEdit = (cx, cy, cz, r, t) => {
 };
 
 // ─────────────────────────── TERRAIN ───────────────────────────
-const hash2 = (x, z, s) => {
-  let h = Math.imul(x | 0, 374761393) + Math.imul(z | 0, 668265263) + Math.imul(s | 0, 1274126177);
-  h = Math.imul(h ^ (h >>> 13), 1274126177); h ^= h >>> 16;
-  return (h >>> 0) / 4294967296;
-};
-const vnoise = (x, z, s) => {
-  const ix = Math.floor(x), iz = Math.floor(z), fx = x - ix, fz = z - iz;
-  const ux = fx * fx * (3 - 2 * fx), uz = fz * fz * (3 - 2 * fz);
-  const a = hash2(ix, iz, s), b = hash2(ix + 1, iz, s), c = hash2(ix, iz + 1, s), d = hash2(ix + 1, iz + 1, s);
-  return (a + (b - a) * ux) * (1 - uz) + (c + (d - c) * ux) * uz;
-};
-
-const noise3 = (x, y, z, s) => {
-  const iy = Math.floor(y), f = y - iy, u = f * f * (3 - 2 * f);
-  return vnoise(x, z, s + iy * 37) * (1 - u) + vnoise(x, z, s + (iy + 1) * 37) * u;
-};
-
 const hsv = (h, s, v) => [5, 3, 1].map((n) => {
   const k = (n + h * 6) % 6;
   return Math.round((v - v * s * Math.max(0, Math.min(k, 4 - k, 1))) * 255);
@@ -549,53 +586,14 @@ const MATS = 14, SHADES = 3;
 const PAL = [[0, 0, 0]];
 for(let m = 0; m < MATS; m++) {
   const u = m / (MATS - 1);
-  const hue = (0.70 + u * 0.38) % 1, sat = 0.52 - 0.34 * u, val = 0.26 + 0.58 * u;
+  const hue = 0.63 - u * 0.14, sat = 0.68 - 0.5 * u, val = 0.2 + 0.72 * u;
   for(let s = 0; s < SHADES; s++) PAL.push(hsv(hue, sat, val * (0.86 + s * 0.14)));
 }
-const base = (m) => 1 + m * SHADES;
-const pick = (m, x, y, z) => base(m) + ((hash2(x * 7 + y, z * 13 + y, 5) * SHADES) | 0);
-
-const heightAt = (wx, wz) => {
-  const n = vnoise(wx / (12 * SCALE), wz / (12 * SCALE), SEED) * 0.55
-    + vnoise(wx / (5 * SCALE), wz / (5 * SCALE), SEED + 1) * 0.3
-    + vnoise(wx / (2 * SCALE), wz / (2 * SCALE), SEED + 2) * 0.15;
-  const ridge = 1 - Math.abs(vnoise(wx / (22 * SCALE), wz / (22 * SCALE), SEED + 3) * 2 - 1);
-  return Math.round(GROUND + (n - 0.5) * HILLS * 2 + ridge * ridge * HILLS * 0.8);
-};
-const blockTop = (wx, wz) => Math.round(heightAt(wx, wz) / BLOCK) * BLOCK;
-
-const isleAt = (wx, y, wz) => Math.abs(y - ISLE_Y) > ISLE_SIZE * 1.4 ? 0
-  : noise3(wx / ISLE_SIZE, y / (ISLE_SIZE * 0.6), wz / ISLE_SIZE, 53) - Math.abs(y - ISLE_Y) / (ISLE_SIZE * 1.4);
-
-const genColumn = (x, z) => {
-  const wx = wox + x, wz = woz + z;
-  const h = blockTop(wx, wz);
-  const bx = Math.floor(wx / BLOCK), bz = Math.floor(wz / BLOCK);
-  let isle = 0, isleTop = false, cy = -1, b = -1;
+const genColumn = (x, z, bytes, off) => {
+  let cy = -1, b = -1;
   for(let y = 0; y < NY; y++) {
-    let t = 0;
+    const t = bytes[off + y];
     if((y >> CL) !== cy) { cy = y >> CL; b = cellB[cellAt(x, y, z)]; }
-    if(y >= h && y % BLOCK === 0) {
-      isle = isleAt(wx, y, wz);
-      isleTop = isle > ISLE_AMOUNT && isleAt(wx, y + BLOCK, wz) <= ISLE_AMOUNT;
-    }
-    const solid = y < h || isle > ISLE_AMOUNT;
-    if(solid) {
-      const depthBlocks = y < h ? Math.floor((h - 1 - y) / BLOCK) : (isleTop ? 0 : 2);
-      const by = Math.floor(y / BLOCK);
-      const lvl = (h - GROUND + HILLS) / (2 * HILLS) + (vnoise(wx / (6 * SCALE), wz / (6 * SCALE), 31) - 0.5) * 0.28;
-      const band = vnoise(wx / (40 * SCALE), wz / (40 * SCALE), 21) * 6 + y / (2.5 * SCALE);
-      const deep = y < h - BLOCK * 3;
-      const deepBand = vnoise((wx >> CL) / 3, (wz >> CL) / 3, 21) * 6 + (y >> CL);
-      const m = depthBlocks === 0 ? Math.max(0, Math.min(MATS - 1, (lvl * MATS) | 0))
-        : depthBlocks === 1 ? Math.max(0, Math.min(MATS - 1, (lvl * MATS) | 0) - 1)
-        : ((Math.floor(deep ? deepBand : band) % MATS) + MATS) % MATS;
-      if(deep) t = base(m) + 1;
-      else {
-        t = pick(m, bx, by, bz);
-        if(hash2(wx * 3, wz * 5, y) > 0.82) t = base(m) + (t - base(m) + 1) % SHADES;
-      }
-    }
     if(b < 0) {
       const was = b === -1 ? 0 : uniType(b);
       if(was === t) continue;
@@ -681,11 +679,26 @@ const pumpPending = (budgetMs) => {
   const t0 = performance.now();
   while(pending.length && performance.now() - t0 < budgetMs) {
     const job = pending[0];
+    if(!job.bytes) {
+      if(!job.want) {
+        job.want = true;
+        job.gw = { wx0: wox + job.x0, wz0: woz + job.z0, w: job.x1 - job.x0, n: (job.x1 - job.x0) * (job.z1 - job.z0) };
+        typeGen(job.gw.wx0, job.gw.wz0, job.gw.w, job.z1 - job.z0)
+          .then((b) => { job.bytes = b; job.want = false; });
+      }
+      return;
+    }
     const z0 = job.z;
     const tIter = performance.now();
     let count = 0;
     while(job.z < job.z1 && count < 256) {
-      genColumn(job.x, job.z);
+      const idx = (woz + job.z - job.gw.wz0) * job.gw.w + (wox + job.x - job.gw.wx0);
+      if(idx < 0 || idx >= job.gw.n) {
+        job.bytes = null;
+        job.want = false;
+        return;
+      }
+      genColumn(job.x, job.z, job.bytes, idx * 256);
       count++;
       if(++job.x >= job.x1) { job.x = job.x0; job.z++; }
     }
@@ -984,6 +997,7 @@ const ICE = ROOM ? { iceServers: [
 ] } : {};
 const lobby = { id: null, host: null, role: null };
 const SIG_LAG = +(new URLSearchParams(location.search).get('lag') || 0);
+const BLIND = new URLSearchParams(location.search).has('blind');
 const lobbyPost = async (op, body) => {
   if(SIG_LAG) await new Promise((r) => setTimeout(r, SIG_LAG));
   return lobbyFetch(op, body);
@@ -1005,8 +1019,14 @@ const lobbyJoin = async () => {
       lobby.host = b.host;
       const roleNow = b.host === lobby.id ? 'host' : 'guest';
       if(roleNow !== lobby.role) {
-        console.warn(`lobby reload: роль ${lobby.role} → ${roleNow}`);
-        location.reload();
+        if(roleNow === 'host' && promoteToHost) {
+          lobby.role = 'host';
+          const p = promoteToHost;
+          promoteToHost = null;
+          p();
+        } else {
+          location.reload();
+        }
       }
     } catch {}
   }, 2000);
@@ -1016,6 +1036,7 @@ const lobbyJoin = async () => {
 let connecting = 0;
 let connectFails = 0;
 const connect = async () => {
+  if(lobby.role === 'host') return;
   const now = performance.now();
   if(connecting && now - connecting < 20000) return;
   connecting = now;
@@ -1026,15 +1047,16 @@ const connect = async () => {
     const v = new DataView(e.data);
     if(v.getUint8(0) !== 3) return;
     const run = v.getUint32(1, true);
-    if(serverRun !== 0 && run !== serverRun) {
-      console.warn(`run reload: ${serverRun} → ${run}`);
+    const prevRun = v.getUint32(13, true);
+    if(serverRun !== 0 && run !== serverRun && prevRun !== serverRun) {
+      console.warn(`run reload: ${serverRun} -> ${run}, lineage broken`);
       location.reload();
       return;
     }
     serverRun = run;
     const n = v.getUint32(5, true);
     for(let i = 0; i < n; i++) {
-      const o = 13 + i * 16;
+      const o = 17 + i * 16;
       addCrater(v.getFloat32(o, true), v.getFloat32(o + 4, true), v.getFloat32(o + 8, true), v.getFloat32(o + 12, true));
     }
   };
@@ -1042,7 +1064,7 @@ const connect = async () => {
     dc.onopen = () => {
       connecting = 0;
       connectFails = 0;
-      net.seq = 0; net.ack = 0; net.inSeq = 0;
+      net.seq = 0; net.ack = 0;
       net.ticks.length = 0;
       net.pending.length = 0;
       net.seen.clear();
@@ -1059,7 +1081,8 @@ const connect = async () => {
     else if(ch.label === 'game') wireGame(ch);
   };
   try {
-    await lobbyPost('send', { to: lobby.host, from: lobby.id, kind: 'knock', sdp: '' });
+    const knockPos = serverRun ? `${(P.x + wox).toFixed(1)},${P.y.toFixed(1)},${(P.z + woz).toFixed(1)}` : '';
+    await lobbyPost('send', { to: lobby.host, from: lobby.id, kind: 'knock', sdp: knockPos });
     for(let tries = 0; tries < 20; tries++) {
       const { mail } = await lobbyPost('recv', { id: lobby.id });
       const off = mail.find((mm) => mm.kind === 'offer');
@@ -1143,7 +1166,7 @@ const handleSnapshot = (data) => {
     }
   }
 };
-if(!ROOM) net.ws = { readyState: 'open', send: () => {} };
+let promoteToHost = null;
 globalThis.hostInput = null;
 globalThis.net = net;
 globalThis.dbg = () => P;
@@ -1582,6 +1605,52 @@ fn border(o: vec3<f32>, d: vec3<f32>, sceneT: f32) -> vec3<f32> {
   return { device, ctx, pipeline, blurPipe, sampler, bind, uniBuf, cellBuf, blockBuf, pyrBuf, bodyBuf, tracerBuf, format, SCENE };
 })();
 
+const typeGen = (() => {
+  if(!gpu) return null;
+  const mod = gpu.device.createShaderModule({ code: document.getElementById('tickwgsl').textContent });
+  const lay = gpu.device.createBindGroupLayout({ entries: [
+    { binding: 15, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 16, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ] });
+  const pipe = gpu.device.createComputePipeline({
+    layout: gpu.device.createPipelineLayout({ bindGroupLayouts: [lay] }),
+    compute: { module: mod, entryPoint: 'gen_types' },
+  });
+  const MAXC = 1024 * 32;
+  const pBuf = gpu.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const oBuf = gpu.device.createBuffer({ size: MAXC * 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const sBuf = gpu.device.createBuffer({ size: MAXC * 256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const grp = gpu.device.createBindGroup({ layout: lay, entries: [
+    { binding: 15, resource: { buffer: pBuf } },
+    { binding: 16, resource: { buffer: oBuf } },
+  ] });
+  let busy = Promise.resolve();
+  return (wx0, wz0, colsX, colsZ) => {
+    const run = async () => {
+      const cols = colsX * colsZ;
+      const p = new ArrayBuffer(16);
+      new Float32Array(p, 0, 2).set([wx0, wz0]);
+      new Uint32Array(p, 8, 2).set([colsX, cols]);
+      gpu.device.queue.writeBuffer(pBuf, 0, p);
+      const e = gpu.device.createCommandEncoder();
+      const ps = e.beginComputePass();
+      ps.setPipeline(pipe);
+      ps.setBindGroup(0, grp);
+      ps.dispatchWorkgroups(Math.ceil(cols / 64));
+      ps.end();
+      e.copyBufferToBuffer(oBuf, 0, sBuf, 0, cols * 256);
+      gpu.device.queue.submit([e.finish()]);
+      await sBuf.mapAsync(GPUMapMode.READ, 0, cols * 256);
+      const out = new Uint8Array(sBuf.getMappedRange(0, cols * 256).slice(0));
+      sBuf.unmap();
+      return out;
+    };
+    const r = busy.then(run, run);
+    busy = r.then(() => {}, () => {});
+    return r;
+  };
+})();
+
 let sceneTex = null, blurBind = null;
 
 const resize = () => {
@@ -1837,9 +1906,11 @@ const render = () => {
     const soak = Math.exp(-dt * 14);
     P.ex *= soak; P.ey *= soak; P.ez *= soak;
     pumpPending(LOAD_BUDGET_MS);
-    const t0 = performance.now();
-    render();
-    renderMs = renderMs * 0.9 + (performance.now() - t0) * 0.1;
+    if(!BLIND) {
+      const t0 = performance.now();
+      render();
+      renderMs = renderMs * 0.9 + (performance.now() - t0) * 0.1;
+    }
     if(now - hudT > 250) {
       hudT = now;
       hud.textContent =
@@ -1849,7 +1920,7 @@ const render = () => {
       net.kbps = net.kbps * 0.5 + (net.bytes / 256) * 0.5;
       net.bytes = 0;
     }
-    requestAnimationFrame(frame);
+    if(!BLIND) requestAnimationFrame(frame);
   };
 
   const knobs = {
@@ -1895,18 +1966,22 @@ const render = () => {
 
   resize();
   const t0 = performance.now();
-  for(let z = 0; z < N; z++) {
-    for(let x = 0; x < N; x++) genColumn(x, z);
-    if((z & 31) === 31) await step(`generating world · ${(z + 1) / 10.24 | 0}%`, (z + 1) / N * 0.9);
+  for(let z0 = 0; z0 < N; z0 += 32) {
+    const bytes = await typeGen(wox, woz + z0, N, 32);
+    for(let z = 0; z < 32; z++) {
+      for(let x = 0; x < N; x++) genColumn(x, z0 + z, bytes, (z * N + x) * 256);
+    }
+    await step(`generating world · ${((z0 + 32) / 10.24) | 0}%`, (z0 + 32) / N * 0.9);
   }
   await step('building pyramid', 0.94);
   reduceBox(0, 0, 0, N - 1, NY - 1, N - 1);
   reapplyCraters(0, 0, N, N);
   await step('uploading to gpu', 0.98);
-  render();
+  if(!BLIND) render();
   console.log(`world ready in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
   loadBox.classList.add('done');
-  requestAnimationFrame(frame);
+  if(BLIND) setInterval(() => frame(performance.now()), 33);
+  else requestAnimationFrame(frame);
 })();
 
 // ─────────────────────────── HOST ───────────────────────────
@@ -1921,21 +1996,37 @@ const render = () => {
         el.textContent = `guest of ${lobby.host} · room ${ROOM}`;
         connect();
         setInterval(() => {
-          if(net.ws && performance.now() - net.lastSnap > 2500) {
+          if(lobby.role !== 'host' && net.ws && performance.now() - net.lastSnap > 2500) {
             try { net.pc.close(); } catch {}
             net.ws = null;
             connect();
           }
         }, 1000);
+        promoteToHost = () => {
+          try { net.pc.close(); } catch {}
+          net.ws = null;
+          startHost(el, true);
+        };
         return;
       }
-      el.textContent = `host · room ${ROOM}`;
-      net.ws = { readyState: 'open', send: () => {} };
     } catch (e) {
-      el.textContent = 'лобби недоступно: ' + e;
+      el.textContent = 'lobby unreachable: ' + e;
       return;
     }
   }
+  await startHost(el, false);
+})();
+
+async function startHost(el, inherit) {
+  el.textContent = ROOM ? `host · room ${ROOM}` : 'host';
+  net.seq = 0; net.ack = 0;
+  net.ticks.length = 0;
+  net.pending.length = 0;
+  net.seen.clear();
+  net.count = 0;
+  net.lastSnap = performance.now();
+  net.ws = { readyState: 'open', send: () => {} };
+  const spawn = inherit ? [P.x + wox, P.y + 2, P.z + woz] : [30, 255, 30];
   const adapter = await navigator.gpu?.requestAdapter();
   if(!adapter) { el.textContent = 'host: no webgpu'; return; }
   const device = await adapter.requestDevice({ requiredLimits: {
@@ -1986,30 +2077,34 @@ const render = () => {
   const slotPool = [];
   let hostTx = 0;
   const conns = new Set();
-  const hostCraterLog = [];
+  const hostCraterLog = craterLog.map((c) => [...c]);
   const hostRunId = (Math.random() * 4294967296) >>> 0;
+  const hostPrevRun = inherit ? serverRun : 0;
   const sendJournal = (ch) => {
     let i = 0;
     do {
       const chunk = hostCraterLog.slice(i, i + 3000);
-      const dv = new DataView(new ArrayBuffer(13 + chunk.length * 16));
+      const dv = new DataView(new ArrayBuffer(17 + chunk.length * 16));
       dv.setUint8(0, 3);
       dv.setUint32(1, hostRunId, true);
       dv.setUint32(5, chunk.length, true);
       dv.setUint32(9, stats.tick, true);
-      chunk.forEach((c, k) => { for(let f = 0; f < 4; f++) dv.setFloat32(13 + k * 16 + f * 4, c[f], true); });
+      dv.setUint32(13, hostPrevRun, true);
+      chunk.forEach((c, k) => { for(let f = 0; f < 4; f++) dv.setFloat32(17 + k * 16 + f * 4, c[f], true); });
       ch.send(dv.buffer);
       i += 3000;
     } while(i < hostCraterLog.length);
   };
-  const wireGuest = (ch, pc) => {
+  const wireGuest = (ch, pc, pos) => {
     const slot = slotPool.length ? slotPool.pop() : nextSlot++;
     if(slot >= NP) { pc.close(); return; }
     const g = { dc: ch, pc, input: new Float32Array(6), seq: 0, lastIn: performance.now() };
     guests.set(slot, g);
     const r = 60 + (slot % 23) * 18, a = slot * 0.7;
     if(bufs) device.queue.writeBuffer(bufs.players, slot * 32,
-      new Float32Array([Math.cos(a) * r, 200, Math.sin(a) * r, 0, 0, 0, 0, 1]));
+      new Float32Array(pos
+        ? [Math.max(-448, Math.min(448, pos[0])), Math.max(1, Math.min(255, pos[1] + 2)), Math.max(-448, Math.min(448, pos[2])), 0, 0, 0, 0, 1]
+        : [Math.cos(a) * r, 255, Math.sin(a) * r, 0, 0, 0, 0, 1]));
     ch.onmessage = (e) => {
       g.lastIn = performance.now();
       const v = new DataView(e.data);
@@ -2043,7 +2138,7 @@ const render = () => {
   };
   if(ROOM) {
     const pendingOffers = new Map();
-    const offerGuest = async (from) => {
+    const offerGuest = async (from, pos) => {
       const pc = new RTCPeerConnection(ICE);
       conns.add(pc);
       pc.onconnectionstatechange = () => {
@@ -2058,7 +2153,7 @@ const render = () => {
       const init = pc.createDataChannel('init');
       init.binaryType = 'arraybuffer';
       init.onopen = () => sendJournal(init);
-      dc.onopen = () => wireGuest(dc, pc);
+      dc.onopen = () => wireGuest(dc, pc, pos);
       await pc.setLocalDescription(await pc.createOffer());
       await new Promise((ok) => {
         if(pc.iceGatheringState === 'complete') return ok();
@@ -2085,7 +2180,9 @@ const render = () => {
               try { old.close(); } catch {}
               conns.delete(old);
             }
-            offerGuest(mm.from).catch((e) => console.warn('offer:', e));
+            const pos = String(mm.sdp || '').split(',').map(Number);
+            offerGuest(mm.from, pos.length === 3 && pos.every(Number.isFinite) ? pos : null)
+              .catch((e) => console.warn('offer:', e));
           }
           if(mm.kind === 'answer') {
             const pc = pendingOffers.get(mm.from);
@@ -2116,7 +2213,7 @@ const render = () => {
       cellAnchor: B(MAX_CELLS * 16, ST),
       cellVis: B(MAX_CELLS * MAX_CELLS * 4, ST),
       bullets: B(maxBullets * 32, ST),
-      craterReq: B(64 * 16, SRC),
+      craterReq: B(2048 * 16, SRC),
       world: B(WORLD * WORLD * 8 * 4, ST),
       stPlayers: B(NP * 32, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST),
       stCellOf: B(NP * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST),
@@ -2133,7 +2230,7 @@ const render = () => {
     }
 
     const ps = new Float32Array(NP * 8);
-    ps[0] = 30; ps[1] = 200; ps[2] = 30; ps[7] = 1;
+    ps[0] = spawn[0]; ps[1] = spawn[1]; ps[2] = spawn[2]; ps[7] = 1;
     device.queue.writeBuffer(bufs.players, 0, ps);
 
     const cfgBuf = new ArrayBuffer(32);
@@ -2155,6 +2252,24 @@ const render = () => {
       const t0 = performance.now();
       await device.queue.onSubmittedWorkDone();
       console.log(`host: world in ${(performance.now() - t0).toFixed(1)} ms`);
+    }
+    for(let i = 0; i < hostCraterLog.length; i += 2048) {
+      const chunk = hostCraterLog.slice(i, i + 2048);
+      const arr = new Float32Array(chunk.length * 4);
+      chunk.forEach((c, k) => arr.set(c, k * 4));
+      device.queue.writeBuffer(bufs.craterReq, 0, arr);
+      device.queue.writeBuffer(bufs.hitCount, 0, new Uint32Array([0, chunk.length]));
+      const e2 = device.createCommandEncoder();
+      const p2 = e2.beginComputePass();
+      p2.setPipeline(pipes.carve_craters);
+      p2.setBindGroup(0, groups.carve_craters);
+      p2.dispatchWorkgroups(16, chunk.length);
+      p2.end();
+      device.queue.submit([e2.finish()]);
+    }
+    if(hostCraterLog.length) {
+      await device.queue.onSubmittedWorkDone();
+      device.queue.writeBuffer(bufs.hitCount, 0, new Uint32Array(2));
     }
 
     const inputs = new Float32Array(NP * 8);
@@ -2298,7 +2413,7 @@ const render = () => {
         const r1 = ((tick * 2654435761 + victim * 40503) % 400) - 200;
         const r2 = ((tick * 40503 + victim * 2654435761) % 400) - 200;
         device.queue.writeBuffer(bufs.players, victim * 32,
-          new Float32Array([r1, 220, r2, 0, 0, 0, 0, 1]));
+          new Float32Array([r1, 255, r2, 0, 0, 0, 0, 1]));
         killEvents.push([shooter, victim]);
       }
 
@@ -2450,7 +2565,7 @@ const render = () => {
     step();
   };
   boot();
-})();
+}
 </script>
 </body>
 </html>
