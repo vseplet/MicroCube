@@ -82,6 +82,8 @@ struct GenP {
 };
 
 const BULLET_R = 3.5;
+const BULLET_LIFE = 15.0;
+const NEW_BULLET = 1024.0;
 
 const CELL_W = 64.0;
 
@@ -314,35 +316,47 @@ fn fly_bullets(@builtin(global_invocation_id) gid: vec3<u32>) {
   if(b1.w < 0.5) { return; }
   let packed = u32(b0.w + 0.5);
   let shooter = packed & 1023u;
-  let delay = min(packed >> 10u, cfg.hist - 2u);
-
+  var delay = 0u;
+  var catchup = 1u;
   var pos = b0.xyz;
+  // New projectiles carry their rewind age above the normal lifetime range.
+  // Spawn at the shooter's historical eye, then simulate every missed server
+  // tick immediately. Once caught up, all later collision is in present time.
+  if(b1.w > NEW_BULLET - 0.5) {
+    delay = min(u32(b1.w - NEW_BULLET + 0.5), min(cfg.hist - 2u, 6u));
+    catchup = delay + 1u;
+    pos = hist[((cfg.tick + cfg.hist - delay) % cfg.hist) * cfg.players + shooter].xyz
+      + vec3<f32>(0.0, 1.6 * SCALE, 0.0);
+  }
   let step = b1.xyz * cfg.dt;
-  let sub = max(1u, u32(ceil(length(step) / 2.0)));
   var dead = false;
-  for(var s = 0u; s < sub && !dead; s++) {
-    pos += step / f32(sub);
-    if(solidAt(pos)) {
-      let c = atomicAdd(&hitCount[1], 1u);
-      if(c < arrayLength(&craterReq)) { craterReq[c] = vec4<f32>(pos, 6.0); }
-      dead = true;
-      break;
-    }
-    for(var j = 0u; j < cfg.players; j++) {
-      if(j == shooter) { continue; }
-      if(players[j].hp < 0.5) { continue; }
-      let t = hist[((cfg.tick + cfg.hist - delay) % cfg.hist) * cfg.players + j].xyz;
-      let dh = vec2<f32>(pos.x - t.x, pos.z - t.z);
-      if(dot(dh, dh) < BULLET_R * BULLET_R && pos.y > t.y && pos.y < t.y + 1.9 * SCALE) {
-        let n = atomicAdd(&hitCount[0], 1u);
-        if(n < arrayLength(&hits)) { hits[n] = Hit(shooter, j, 0.0, cfg.tick); }
+  for(var age = 0u; age < catchup && !dead; age++) {
+    let sub = max(1u, u32(ceil(length(step) / 2.0)));
+    let histAgo = delay - min(delay, age);
+    for(var s = 0u; s < sub && !dead; s++) {
+      pos += step / f32(sub);
+      if(solidAt(pos)) {
+        let c = atomicAdd(&hitCount[1], 1u);
+        if(c < arrayLength(&craterReq)) { craterReq[c] = vec4<f32>(pos, 6.0); }
         dead = true;
         break;
+      }
+      for(var j = 0u; j < cfg.players; j++) {
+        if(j == shooter || players[j].hp < 0.5) { continue; }
+        let t = hist[((cfg.tick + cfg.hist - histAgo) % cfg.hist) * cfg.players + j].xyz;
+        let dh = vec2<f32>(pos.x - t.x, pos.z - t.z);
+        if(dot(dh, dh) < BULLET_R * BULLET_R && pos.y > t.y && pos.y < t.y + 1.9 * SCALE) {
+          let n = atomicAdd(&hitCount[0], 1u);
+          if(n < arrayLength(&hits)) { hits[n] = Hit(shooter, j, 0.0, cfg.tick); }
+          dead = true;
+          break;
+        }
       }
     }
   }
   bullets[i * 2u] = vec4<f32>(pos, b0.w);
-  bullets[i * 2u + 1u] = vec4<f32>(b1.xyz, select(b1.w - 1.0, 0.0, dead));
+  let life = select(b1.w - 1.0, max(0.0, BULLET_LIFE - f32(catchup)), b1.w > NEW_BULLET - 0.5);
+  bullets[i * 2u + 1u] = vec4<f32>(b1.xyz, select(life, 0.0, dead));
 }
 
 @compute @workgroup_size(64)
@@ -880,16 +894,32 @@ const PYR_BASE = CL;
 const MAX_BLOCKS = 262144;
 const MAX_BODIES = 256;
 
+const MODEL_SX = 14, MODEL_SY = 41, MODEL_SZ = 18;
+const MODEL_VS = 1.8 * SCALE / MODEL_SY;
+const MODEL_PAL = [[39,44,49],[30,33,39],[119,42,42],[141,62,62],[48,54,60],[48,54,60],[82,93,111],[64,72,86],[46,52,61],[115,132,141]];
+const MODEL_B64 = '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';
+const MODEL_GRID = (() => {
+  const g = new Uint8Array(MODEL_SX * MODEL_SY * MODEL_SZ);
+  const s = atob(MODEL_B64);
+  for(let i = 0; i < s.length; i += 3) g[s.charCodeAt(i) + (s.charCodeAt(i + 1) << 8)] = s.charCodeAt(i + 2);
+  return g;
+})();
+const OBJ_CAP = 7;
+const OBJ_R = Math.ceil(Math.hypot(MODEL_SX, MODEL_SZ) * 0.5 * MODEL_VS) + 1;
+const OBJ_H = Math.ceil(MODEL_SY * MODEL_VS);
+const MAX_OBJ_ENTS = 16384;
+
 const net = {
   ws: null, self: null, fresh: false, count: 0, seq: 0, ack: 0, inSeq: 0, bytes: 0, kbps: 0,
-  ticks: [],
+  ticks: [], interpMs: 1000 / 15, jitterMs: 0, lastArrival: 0,
   seen: new Map(),
   pending: [],
-  bodies: new Float32Array(MAX_BODIES * 4),
+  bodies: new Float32Array(MAX_BODIES * 8),
 };
 const BODY_KEEP = 700;
 
 const BULLET_SPEED = 1200;
+const NEW_BULLET_MARKER = 1024;
 const TRACER_LEN = 40;
 const liveBullets = [];
 const spawnBullet = (shooter, x, y, z, dx, dy, dz) => {
@@ -984,7 +1014,10 @@ const hitFlash = () => {
   aim.style.transform = 'scale(1.8)';
   setTimeout(() => { aim.style.borderColor = ''; aim.style.transform = ''; }, 120);
 };
-const INTERP_LAG = 60;
+const NET_TICK_MS = 1000 / 30;
+const MAX_REWIND_TICKS = 6; // 200 ms: useful compensation without excessive peek advantage
+const seqNewer = (a, b) => a !== b && ((a - b) >>> 0) < 0x80000000;
+const packetHas = (v, off, size) => off >= 0 && size >= 0 && off + size <= v.byteLength;
 
 // ─────────────────────────── LOBBY ───────────────────────────
 const ROOM = new URLSearchParams(location.search).get('room') || 'dev';
@@ -1045,16 +1078,17 @@ const connect = async () => {
   net.pc = pc;
   const wireInit = (init) => init.onmessage = (e) => {
     const v = new DataView(e.data);
-    if(v.getUint8(0) !== 3) return;
+    if(!packetHas(v, 0, 17) || v.getUint8(0) !== 3) return;
     const run = v.getUint32(1, true);
     const prevRun = v.getUint32(13, true);
+    const n = v.getUint32(5, true);
+    if(n > 3000 || !packetHas(v, 17, n * 16)) return;
     if(serverRun !== 0 && run !== serverRun && prevRun !== serverRun) {
       console.warn(`run reload: ${serverRun} -> ${run}, lineage broken`);
       location.reload();
       return;
     }
     serverRun = run;
-    const n = v.getUint32(5, true);
     for(let i = 0; i < n; i++) {
       const o = 17 + i * 16;
       addCrater(v.getFloat32(o, true), v.getFloat32(o + 4, true), v.getFloat32(o + 8, true), v.getFloat32(o + 12, true));
@@ -1068,6 +1102,9 @@ const connect = async () => {
       net.ticks.length = 0;
       net.pending.length = 0;
       net.seen.clear();
+      net.lastArrival = 0;
+      net.jitterMs = 0;
+      net.interpMs = NET_TICK_MS * 2;
       net.lastSnap = performance.now();
       net.ws = dc;
     };
@@ -1132,20 +1169,39 @@ const connect = async () => {
 };
 
 const handleSnapshot = (data) => {
-  net.lastSnap = performance.now();
-  net.bytes += data.byteLength;
   const v = new DataView(data);
-  if(v.getUint8(0) !== 2) return;
+  if(!packetHas(v, 0, 15) || v.getUint8(0) !== 2) return false;
   {
     const seq = v.getUint32(1, true);
-    if(seq <= net.seq) return;
+    if(!seqNewer(seq, net.seq)) return false;
+    const announced = v.getUint16(13, true);
+    if(announced > MAX_BODIES || !packetHas(v, 15, announced * 18 + 2)) return false;
+    let scan = 15 + announced * 18;
+    const eventCount = v.getUint16(scan, true); scan += 2;
+    if(!packetHas(v, scan, eventCount * 4 + 2)) return false;
+    scan += eventCount * 4;
+    const shotCount = v.getUint16(scan, true); scan += 2;
+    if(!packetHas(v, scan, shotCount * 26 + 2)) return false;
+    scan += shotCount * 26;
+    const holeCount = v.getUint16(scan, true); scan += 2;
+    if(!packetHas(v, scan, holeCount * 16)) return false;
+    const arrival = performance.now();
+    if(net.lastArrival) {
+      const sample = Math.abs(arrival - net.lastArrival - NET_TICK_MS);
+      net.jitterMs += (sample - net.jitterMs) * 0.1;
+      net.interpMs = Math.max(NET_TICK_MS * 2, Math.min(180, NET_TICK_MS * 2 + net.jitterMs * 2));
+    }
+    net.lastArrival = arrival;
+    net.lastSnap = arrival;
+    net.bytes += data.byteLength;
     net.seq = seq;
-    net.ticks.push([seq, performance.now()]);
+    net.ticks.push([seq, arrival]);
     if(net.ticks.length > 16) net.ticks.shift();
     net.ack = v.getUint32(5, true);
     net.selfVy = v.getFloat32(9, true);
-    const n = Math.min(v.getUint16(13, true), MAX_BODIES);
-    const now = performance.now();
+    const n = announced;
+    net.count = n;
+    const now = arrival;
     for(let i = 0; i < n; i++) {
       const o = 15 + i * 18;
       const id = v.getUint16(o, true);
@@ -1153,11 +1209,11 @@ const handleSnapshot = (data) => {
       const yaw = v.getFloat32(o + 14, true);
       if(id === 0) { net.self = { x, y, z, yaw }; net.fresh = true; continue; }
       const b = net.seen.get(id);
-      if(b) { b.px = b.tx; b.py = b.ty; b.pz = b.tz; b.pt = b.tt; b.tx = x; b.ty = y; b.tz = z; b.tt = now; b.yaw = yaw; }
-      else net.seen.set(id, { px: x, py: y, pz: z, pt: now - 33, tx: x, ty: y, tz: z, tt: now, yaw });
+      if(b) { b.px = b.tx; b.py = b.ty; b.pz = b.tz; b.pt = b.tt; b.pyaw = b.yaw; b.tx = x; b.ty = y; b.tz = z; b.tt = now; b.yaw = yaw; }
+      else net.seen.set(id, { px: x, py: y, pz: z, pt: now - 33, tx: x, ty: y, tz: z, tt: now, pyaw: yaw, yaw });
     }
     let eo = 15 + n * 18;
-    const events = v.getUint16(eo, true);
+    const events = eventCount;
     eo += 2;
     for(let i = 0; i < events; i++) {
       const shooter = v.getUint16(eo, true);
@@ -1167,7 +1223,7 @@ const handleSnapshot = (data) => {
       const dead = net.seen.get(victim);
       if(dead) net.seen.delete(victim);
     }
-    const shots = v.getUint16(eo, true);
+    const shots = shotCount;
     eo += 2;
     for(let i = 0; i < shots; i++) {
       const shooter = v.getUint16(eo, true);
@@ -1177,7 +1233,7 @@ const handleSnapshot = (data) => {
       if(shooter === 0) continue;
       spawnBullet(shooter, ox - wox, oy, oz - woz, dx, dy, dz);
     }
-    const holes = v.getUint16(eo, true);
+    const holes = holeCount;
     eo += 2;
     for(let i = 0; i < holes; i++) {
       const hx = v.getFloat32(eo, true), hy = v.getFloat32(eo + 4, true), hz = v.getFloat32(eo + 8, true), hr = v.getFloat32(eo + 12, true);
@@ -1187,6 +1243,7 @@ const handleSnapshot = (data) => {
       perf.crater += performance.now() - tc;
     }
   }
+  return true;
 };
 let promoteToHost = null;
 globalThis.hostInput = null;
@@ -1223,8 +1280,18 @@ const gpu = await (async () => {
   const blockBuf = buf(MAX_BLOCKS * CELL3, ST);
   const pyrBuf = buf(pyrPack.byteLength, ST);
   const palBuf = buf(PAL.length * 16, ST);
-  const bodyBuf = buf(MAX_BODIES * 16, ST);
+  const bodyBuf = buf(MAX_BODIES * 32, ST);
   const tracerBuf = buf(64 * 32, ST);
+  const objRefBuf = buf(NC * NCY * NC * 8, ST);
+  const objEntBuf = buf(4 + MAX_OBJ_ENTS * 12, ST);
+  const modelWords = Math.ceil(MODEL_GRID.length / 4);
+  const modelBuf = buf((modelWords + MODEL_PAL.length + 1) * 4, ST);
+  {
+    const md = new Uint32Array(modelWords + MODEL_PAL.length + 1);
+    new Uint8Array(md.buffer, 0, MODEL_GRID.length).set(MODEL_GRID);
+    MODEL_PAL.forEach((c, i) => { md[modelWords + 1 + i] = c[0] | (c[1] << 8) | (c[2] << 16); });
+    device.queue.writeBuffer(modelBuf, 0, md);
+  }
 
   const palData = new Float32Array(PAL.length * 4);
   PAL.forEach((c, i) => { palData[i * 4] = c[0] / 255; palData[i * 4 + 1] = c[1] / 255; palData[i * 4 + 2] = c[2] / 255; });
@@ -1243,6 +1310,12 @@ const MAX_BLOCKS = ${MAX_BLOCKS}u;
 const LMAX = ${LMAX}u;
 const PYR_BASE = ${PYR_BASE}u;
 const EPS = 1e-4;
+const MSX = ${MODEL_SX};
+const MSY = ${MODEL_SY};
+const MSZ = ${MODEL_SZ};
+const MVS = ${MODEL_VS};
+const MPAL = ${modelWords}u;
+const OBJ_CAP = ${OBJ_CAP}u;
 const PYR_OFF = array<u32, ${LMAX + 1}>(${pyrOff.map((o) => o + 'u').join(', ')});
 
 
@@ -1270,6 +1343,8 @@ struct U {
 @group(0) @binding(4) var<storage, read> pal: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read> bodies: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read> tracers: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read> objRef: array<vec2<u32>>;
+@group(0) @binding(8) var<storage, read> model: array<u32>;
 
 fn tracerGlow(o: vec3<f32>, d: vec3<f32>, sceneT: f32) -> vec3<f32> {
   var glow = vec3<f32>(0.0);
@@ -1307,37 +1382,67 @@ fn tracerGlow(o: vec3<f32>, d: vec3<f32>, sceneT: f32) -> vec3<f32> {
   return glow;
 }
 
-struct BodyHit { hit: bool, t: f32, n: vec3<f32>, col: vec3<f32> };
+var<private> gObjN: vec3<f32>;
+var<private> gObjC: u32;
 
-fn hitBodies(o: vec3<f32>, d: vec3<f32>, maxT: f32) -> BodyHit {
-  var out: BodyHit;
-  out.hit = false;
-  out.t = maxT;
-  let count = u32(u.opts2.x);
-  let half = vec3<f32>(0.35, 0.9, 0.35) * ${SCALE}.0;
-  for(var i = 0u; i < count; i++) {
-    let b = bodies[i];
-    let c = b.xyz + vec3<f32>(0.0, half.y, 0.0);
-    let inv = 1.0 / d;
-    let t1 = (c - half - o) * inv;
-    let t2 = (c + half - o) * inv;
-    let lo = min(t1, t2);
-    let hi = max(t1, t2);
-    let tn = max(max(lo.x, lo.y), lo.z);
-    let tf = min(min(hi.x, hi.y), hi.z);
-    if(tf < tn || tf < 0.0 || tn > out.t) { continue; }
-    out.hit = true;
-    out.t = max(tn, 0.0);
-    let p = o + d * out.t - c;
-    let a = abs(p) / half;
-    if(a.x > a.y && a.x > a.z) { out.n = vec3<f32>(sign(p.x), 0.0, 0.0); }
-    else if(a.y > a.z) { out.n = vec3<f32>(0.0, sign(p.y), 0.0); }
-    else { out.n = vec3<f32>(0.0, 0.0, sign(p.z)); }
-    let hue = fract(b.w * 0.618034);
-    let rgb = clamp(abs(fract(vec3<f32>(hue) + vec3<f32>(0.0, 0.6667, 0.3333)) * 6.0 - 3.0) - 1.0, vec3<f32>(0.0), vec3<f32>(1.0));
-    out.col = mix(vec3<f32>(0.5), rgb, 0.65) * 0.9;
+fn mvox(i: u32) -> u32 { return (model[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu; }
+fn mcol(i: u32) -> vec3<f32> {
+  let w = model[MPAL + i];
+  return vec3<f32>(f32(w & 0xffu), f32((w >> 8u) & 0xffu), f32((w >> 16u) & 0xffu)) / 255.0;
+}
+
+fn traceObjs(o: vec3<f32>, d: vec3<f32>, ta: f32, tb: f32, ci: u32) -> f32 {
+  var best = -1.0;
+  let r = objRef[ci];
+  let cnt = min(r.x & 0xffu, OBJ_CAP);
+  for(var k = 0u; k < cnt; k++) {
+    var bi = 0u;
+    if(k < 3u) { bi = (r.x >> ((k + 1u) * 8u)) & 0xffu; }
+    else { bi = (r.y >> ((k - 3u) * 8u)) & 0xffu; }
+    let b0 = bodies[bi * 2u];
+    let c = cos(b0.w); let s = sin(b0.w);
+    let r0 = o - b0.xyz;
+    let bmax = vec3<f32>(f32(MSX), f32(MSY), f32(MSZ)) * MVS;
+    let lp = vec3<f32>(c * r0.x - s * r0.z + bmax.x * 0.5, r0.y, s * r0.x + c * r0.z + bmax.z * 0.5);
+    let ld = vec3<f32>(c * d.x - s * d.z, d.y, s * d.x + c * d.z);
+    var t0 = ta; var t1 = tb; var ax0 = 0u; var miss = false;
+    for(var a = 0; a < 3; a++) {
+      let li = ld[a]; let pi = lp[a];
+      if(abs(li) < 1e-7) { if(pi < 0.0 || pi > bmax[a]) { miss = true; } continue; }
+      var t_a = (0.0 - pi) / li; var t_b = (bmax[a] - pi) / li;
+      if(t_a > t_b) { let q = t_a; t_a = t_b; t_b = q; }
+      if(t_a > t0) { t0 = t_a; ax0 = u32(a); }
+      if(t_b < t1) { t1 = t_b; }
+    }
+    if(miss || t1 <= t0) { continue; }
+    var t = t0;
+    let pe = lp + ld * (t0 + 1e-4 * (1.0 + abs(t0)));
+    var ix = clamp(i32(floor(pe.x / MVS)), 0, MSX - 1); var iy = clamp(i32(floor(pe.y / MVS)), 0, MSY - 1); var iz = clamp(i32(floor(pe.z / MVS)), 0, MSZ - 1);
+    let stx = select(-1, 1, ld.x > 0.0); let sty = select(-1, 1, ld.y > 0.0); let stz = select(-1, 1, ld.z > 0.0);
+    var tmx = 1e30; var tmy = 1e30; var tmz = 1e30;
+    if(abs(ld.x) > 1e-7) { tmx = (f32(ix + select(0, 1, ld.x > 0.0)) * MVS - lp.x) / ld.x; }
+    if(abs(ld.y) > 1e-7) { tmy = (f32(iy + select(0, 1, ld.y > 0.0)) * MVS - lp.y) / ld.y; }
+    if(abs(ld.z) > 1e-7) { tmz = (f32(iz + select(0, 1, ld.z > 0.0)) * MVS - lp.z) / ld.z; }
+    let tdx = MVS / max(abs(ld.x), 1e-7); let tdy = MVS / max(abs(ld.y), 1e-7); let tdz = MVS / max(abs(ld.z), 1e-7);
+    var axis = ax0;
+    for(var step = 0; step < MSX + MSY + MSZ + 3; step++) {
+      let ty = mvox(u32((iz * MSY + iy) * MSX + ix));
+      if(ty != 0u) {
+        if(best < 0.0 || t < best) {
+          best = t; gObjC = ty;
+          var nl = vec3<f32>(0.0);
+          if(axis == 0u) { nl.x = select(1.0, -1.0, ld.x > 0.0); } else if(axis == 1u) { nl.y = select(1.0, -1.0, ld.y > 0.0); } else { nl.z = select(1.0, -1.0, ld.z > 0.0); }
+          gObjN = vec3<f32>(c * nl.x + s * nl.z, nl.y, -s * nl.x + c * nl.z);
+        }
+        break;
+      }
+      if(tmx <= tmy && tmx <= tmz) { t = tmx; tmx += tdx; ix += stx; axis = 0u; }
+      else if(tmy <= tmz) { t = tmy; tmy += tdy; iy += sty; axis = 1u; }
+      else { t = tmz; tmz += tdz; iz += stz; axis = 2u; }
+      if(ix < 0 || iy < 0 || iz < 0 || ix >= MSX || iy >= MSY || iz >= MSZ || t > t1) { break; }
+    }
   }
-  return out;
+  return best;
 }
 
 fn outside(p: vec3<i32>) -> bool {
@@ -1359,7 +1464,10 @@ fn voxAt(p: vec3<i32>) -> u32 {
 }
 
 fn nodeAt(L: u32, p: vec3<i32>) -> u32 {
-  if(L == CL) { return select(1u, 0u, cells[cellIdx(p)] == -1); }
+  if(L == CL) {
+    let ci = cellIdx(p);
+    return select(1u, 0u, cells[ci] == -1) | select(0u, 2u, (objRef[u32(ci)].x & 0xffu) != 0u);
+  }
   let nx = N >> L;
   let ny = NY >> L;
   let i = PYR_OFF[L] + u32(((p.z >> L) * ny + (p.y >> L)) * nx + (p.x >> L));
@@ -1396,7 +1504,7 @@ fn clipBox(o: vec3<f32>, d: vec3<f32>) -> vec2<f32> {
   return vec2<f32>(max(t0, 0.0), t1);
 }
 
-struct Hit { hit: bool, t: f32, v: vec3<i32>, axis: i32, kind: u32 };
+struct Hit { hit: bool, t: f32, v: vec3<i32>, axis: i32, kind: u32, obj: bool, n: vec3<f32> };
 
 fn snapHit(o: vec3<f32>, inv: vec3<f32>, d: vec3<f32>, start: vec3<i32>, t0: f32) -> Hit {
   var v = start;
@@ -1435,7 +1543,12 @@ fn trace(o: vec3<f32>, d: vec3<f32>, tMax: f32, stopL: u32) -> Hit {
     select(0.0, 1.0 / d.z, d.z != 0.0));
   var L = LMAX;
   var axis = 0.0;
+  var objT = -1.0;
+  var objN = vec3<f32>(0.0);
+  var objC = 0u;
+  var lastCi = -1;
   for(var guard = 0; guard < 4096 && t < t1; guard++) {
+    if(objT >= 0.0 && t >= objT) { break; }
     let eps = max(EPS, t * 1e-5);
     let p = o + d * (t + eps);
     if(any(p < vec3<f32>(0.0)) || any(p >= vec3<f32>(f32(N), f32(NY), f32(N)))) { break; }
@@ -1445,6 +1558,17 @@ fn trace(o: vec3<f32>, d: vec3<f32>, tMax: f32, stopL: u32) -> Hit {
       if(L == 0u) { v = voxAt(ip); break; }
       v = nodeAt(L, ip);
       if(v == 0u || L == stopL) { break; }
+      if(L == PYR_BASE && (v & 2u) != 0u) {
+        let ci = cellIdx(ip);
+        if(ci != lastCi) {
+          lastCi = ci;
+          let e = exitFast(o, inv, i32(CELL), ip >> vec3<u32>(CL));
+          let lim = select(min(e.x, t1), min(min(e.x, t1), objT), objT >= 0.0);
+          let r = traceObjs(o, d, max(t, 0.0), lim, u32(ci));
+          if(r >= 0.0) { objT = r; objN = gObjN; objC = gObjC; }
+        }
+        if((v & 1u) == 0u) { v = 0u; break; }
+      }
       L = select(L - 1u, 0u, L == PYR_BASE);
     }
     if(v == 0u) {
@@ -1457,8 +1581,10 @@ fn trace(o: vec3<f32>, d: vec3<f32>, tMax: f32, stopL: u32) -> Hit {
     if(stopL > 0u) { out.hit = true; out.t = t; return out; }
     var h = snapHit(o, inv, d, ip, clip.x);
     h.kind = voxAt(h.v);
+    if(objT >= 0.0 && objT <= h.t) { out.hit = true; out.t = objT; out.obj = true; out.n = objN; out.kind = objC; return out; }
     return h;
   }
+  if(objT >= 0.0) { out.hit = true; out.t = objT; out.obj = true; out.n = objN; out.kind = objC; }
   return out;
 }
 
@@ -1503,14 +1629,18 @@ fn shade(d: vec3<f32>) -> vec4<f32> {
   let maxD = u.up.w;
 
   let h = trace(o, d, maxD, 0u);
-  let bh = hitBodies(o, d, select(maxD, h.t, h.hit));
-  if(bh.hit) {
-    let lam = max(0.0, dot(bh.n, u.sun.xyz));
-    let k = u.fwd.w + (1.0 - u.fwd.w) * lam;
-    let fog = clamp((bh.t - u.skyHor.w) / (u.fogCol.w - u.skyHor.w), 0.0, 1.0);
-    return vec4<f32>(mix(bh.col * k, u.fogCol.rgb, fog), bh.t);
-  }
   if(!h.hit) { return vec4<f32>(sky(d) + border(o, d, maxD), maxD); }
+
+  if(h.obj) {
+    let lam = max(0.0, dot(h.n, u.sun.xyz));
+    var k = u.fwd.w + (1.0 - u.fwd.w) * lam;
+    if(u.opts.y > 0.5 && lam > 0.0) {
+      let sh = trace(o + d * h.t + h.n * 0.6, u.sun.xyz, u.opts.z, u32(u.misc.x));
+      if(sh.hit) { k *= u.opts.w; }
+    }
+    let fog = clamp((h.t - u.skyHor.w) / (u.fogCol.w - u.skyHor.w), 0.0, 1.0);
+    return vec4<f32>(mix(mcol(h.kind) * k, u.fogCol.rgb, fog) + border(o, d, h.t), h.t);
+  }
 
   var n = vec3<f32>(0.0);
   if(h.axis == 0) { n.x = select(1.0, -1.0, d.x > 0.0); }
@@ -1622,9 +1752,27 @@ fn border(o: vec3<f32>, d: vec3<f32>, sceneT: f32) -> vec3<f32> {
       { binding: 3, resource: { buffer: pyrBuf } },
       { binding: 4, resource: { buffer: palBuf } },
       { binding: 5, resource: { buffer: bodyBuf } },
+      { binding: 7, resource: { buffer: objRefBuf } },
+      { binding: 8, resource: { buffer: modelBuf } },
     ],
   });
-  return { device, ctx, pipeline, blurPipe, sampler, bind, uniBuf, cellBuf, blockBuf, pyrBuf, bodyBuf, tracerBuf, format, SCENE };
+  const scatMod = device.createShaderModule({ code: `
+@group(0) @binding(0) var<storage, read> ents: array<u32>;
+@group(0) @binding(1) var<storage, read_write> refs: array<vec2<u32>>;
+@compute @workgroup_size(64) fn scat(@builtin(global_invocation_id) g: vec3<u32>) {
+  if(g.x >= ents[0]) { return; }
+  let b = 1u + g.x * 3u;
+  refs[ents[b]] = vec2<u32>(ents[b + 1u], ents[b + 2u]);
+}` });
+  const scatPipe = device.createComputePipeline({ layout: 'auto', compute: { module: scatMod, entryPoint: 'scat' } });
+  const scatBind = device.createBindGroup({
+    layout: scatPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: objEntBuf } },
+      { binding: 1, resource: { buffer: objRefBuf } },
+    ],
+  });
+  return { device, ctx, pipeline, blurPipe, sampler, bind, uniBuf, cellBuf, blockBuf, pyrBuf, bodyBuf, tracerBuf, objEntBuf, scatPipe, scatBind, format, SCENE };
 })();
 
 const typeGen = (() => {
@@ -1710,10 +1858,13 @@ const upload = () => {
   if(dirtyCells) { q.writeBuffer(gpu.cellBuf, 0, cellB); dirtyCells = false; }
   if(dirtyPyr) {
     for(let L = CL + 1; L <= LMAX; L++) pyrPack.set(lv[L], pyrOff[L]);
-    q.writeBuffer(gpu.pyrBuf, 0, pyrPack);
     dirtyPyr = false;
   }
 };
+const pyrDraw = new Uint8Array(pyrPack.length);
+const objEnts = new Uint32Array(1 + MAX_OBJ_ENTS * 3);
+const objCellIds = new Map();
+let prevObjCells = new Set();
 
 const render = () => {
   if(!gpu) return;
@@ -1732,22 +1883,50 @@ const render = () => {
   uni.set([AO ? 1 : 0, SHADOW ? 1 : 0, SHADOW_DIST, SHADOW_DARK], 36);
   uni.set([SHADOW_LOD > 0 ? PYR_BASE : 0, RW, RH, 0], 40);
   uni.set([MAX_DIST * DOF_START, MAX_DIST * DOF_END, DOF_R, 0], 44);
-  const now = performance.now() - INTERP_LAG;
+  const now = performance.now();
+  const renderAt = now - net.interpMs;
   let w = 0;
+  objCellIds.clear();
   for(const [id, b] of net.seen) {
     if(now - b.tt > BODY_KEEP) { net.seen.delete(id); continue; }
     const span = Math.max(1, b.tt - b.pt);
-    const k = Math.max(0, Math.min(1.6, (now - b.pt) / span));
-    net.bodies.set([
-      b.px + (b.tx - b.px) * k - wox,
-      b.py + (b.ty - b.py) * k,
-      b.pz + (b.tz - b.pz) * k - woz,
-      id,
-    ], w * 4);
+    // Render a buffered point between snapshots. Extrapolate only briefly when
+    // jitter exhausts that buffer, then freeze instead of letting bodies warp.
+    const k = Math.max(0, Math.min(1.25, (renderAt - b.pt) / span));
+    const py = b.pyaw ?? b.yaw;
+    let dy = b.yaw - py;
+    dy -= Math.round(dy / (2 * Math.PI)) * 2 * Math.PI;
+    const bx = b.px + (b.tx - b.px) * k - wox;
+    const by = b.py + (b.ty - b.py) * k;
+    const bz = b.pz + (b.tz - b.pz) * k - woz;
+    net.bodies.set([bx, by, bz, py + dy * Math.min(k, 1), id, 0, 0, 0], w * 8);
+    const cx0 = Math.max(0, (bx - OBJ_R) >> CL), cx1 = Math.min(NC - 1, (bx + OBJ_R) >> CL);
+    const cy0 = Math.max(0, by >> CL), cy1 = Math.min(NCY - 1, (by + OBJ_H) >> CL);
+    const cz0 = Math.max(0, (bz - OBJ_R) >> CL), cz1 = Math.min(NC - 1, (bz + OBJ_R) >> CL);
+    for(let cz = cz0; cz <= cz1; cz++) for(let cy = cy0; cy <= cy1; cy++) for(let cx = cx0; cx <= cx1; cx++) {
+      const ci = (cz * NCY + cy) * NC + cx;
+      const l = objCellIds.get(ci);
+      if(!l) objCellIds.set(ci, [w]);
+      else if(l.length < OBJ_CAP) l.push(w);
+    }
     if(++w >= MAX_BODIES) break;
   }
   net.count = w;
-  if(w) gpu.device.queue.writeBuffer(gpu.bodyBuf, 0, net.bodies, 0, w * 4);
+  if(w) gpu.device.queue.writeBuffer(gpu.bodyBuf, 0, net.bodies, 0, w * 8);
+  let en = 0;
+  for(const ci of prevObjCells) {
+    if(objCellIds.has(ci) || en >= MAX_OBJ_ENTS) continue;
+    objEnts[1 + en * 3] = ci; objEnts[2 + en * 3] = 0; objEnts[3 + en * 3] = 0; en++;
+  }
+  for(const [ci, l] of objCellIds) {
+    if(en >= MAX_OBJ_ENTS) break;
+    let w0 = l.length, w1 = 0;
+    for(let j = 0; j < l.length; j++) { if(j < 3) w0 |= l[j] << ((j + 1) * 8); else w1 |= l[j] << ((j - 3) * 8); }
+    objEnts[1 + en * 3] = ci; objEnts[2 + en * 3] = w0; objEnts[3 + en * 3] = w1; en++;
+  }
+  objEnts[0] = en;
+  if(en) gpu.device.queue.writeBuffer(gpu.objEntBuf, 0, objEnts, 0, 1 + en * 3);
+  prevObjCells = new Set(objCellIds.keys());
 
   const tnow = performance.now();
   let tc = 0;
@@ -1770,8 +1949,29 @@ const render = () => {
   gpu.device.queue.writeBuffer(gpu.uniBuf, 0, uni);
 
   upload();
+  pyrDraw.set(pyrPack);
+  for(let i = 0; i < w; i++) {
+    const bx = net.bodies[i * 8], by = net.bodies[i * 8 + 1], bz = net.bodies[i * 8 + 2];
+    const x0 = Math.max(0, (bx - OBJ_R) | 0), x1 = Math.min(N - 1, (bx + OBJ_R) | 0);
+    const y0 = Math.max(0, by | 0), y1 = Math.min(NY - 1, (by + OBJ_H) | 0);
+    const z0 = Math.max(0, (bz - OBJ_R) | 0), z1 = Math.min(N - 1, (bz + OBJ_R) | 0);
+    for(let L = CL + 1; L <= LMAX; L++) {
+      const nx = N >> L, ny = NY >> L, o = pyrOff[L];
+      const lx0 = x0 >> L, lx1 = x1 >> L, ly0 = Math.min(y0 >> L, ny - 1), ly1 = Math.min(y1 >> L, ny - 1), lz0 = z0 >> L, lz1 = z1 >> L;
+      for(let z = lz0; z <= lz1; z++) for(let y = ly0; y <= ly1; y++) for(let x = lx0; x <= lx1; x++)
+        pyrDraw[o + (z * ny + y) * nx + x] |= 2;
+    }
+  }
+  gpu.device.queue.writeBuffer(gpu.pyrBuf, 0, pyrDraw);
 
   const enc = gpu.device.createCommandEncoder();
+  if(en) {
+    const cp = enc.beginComputePass();
+    cp.setPipeline(gpu.scatPipe);
+    cp.setBindGroup(0, gpu.scatBind);
+    cp.dispatchWorkgroups(Math.ceil(en / 64));
+    cp.end();
+  }
   const draw = (pipe, bind, view) => {
     const pass = enc.beginRenderPass({
       colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
@@ -1848,8 +2048,8 @@ const render = () => {
   };
   const sendInput = (dt) => {
     if(!net.ws || net.ws.readyState !== 'open') return null;
-    let aim = net.seq - 4;
-    const shown = performance.now() - INTERP_LAG;
+    let aim = Math.max(0, net.seq - Math.ceil(net.interpMs / NET_TICK_MS));
+    const shown = performance.now() - net.interpMs;
     for(let i = net.ticks.length - 1; i > 0; i--) {
       const [tB, atB] = net.ticks[i], [tA, atA] = net.ticks[i - 1];
       if(shown >= atA && shown <= atB) { aim = tA + (tB - tA) * (shown - atA) / (atB - atA); break; }
@@ -2063,7 +2263,9 @@ async function startHost(el, inherit) {
 
   const HIST = 64, MAX_VIS = 255, TICKRATE = 30, WORLD = 1024, MAX_CELLS = 1024;
   const BULLET_SPEED = 1200, BULLET_LIFE = 0.5 * TICKRATE;
-  let NP = +(new URLSearchParams(location.search).get('n') || 256);
+  const FIRE_COOLDOWN_TICKS = 3;
+  const requestedPlayers = Number.parseInt(new URLSearchParams(location.search).get('n') || '256', 10);
+  let NP = Math.max(1, Math.min(MAX_CELLS, Number.isFinite(requestedPlayers) ? requestedPlayers : 256));
 
   const BINDS = ['cfg', 'players', 'inputs', 'hist', 'visCount', 'visList', 'hitCount', 'hits',
     'cellOf', 'cellAnchor', 'cellVis', 'bullets', 'craterReq', 'world', 'world'];
@@ -2092,7 +2294,10 @@ async function startHost(el, inherit) {
 
   let gen = 0, bufs = null;
   const stats = { tick: 0, sim: [], read: [], cells: [], total: [], snap: [] };
-  globalThis.host = { stats, setPlayers: (n) => { NP = n; boot(); } };
+  globalThis.host = { stats, setPlayers: (n) => {
+    NP = Math.max(1, Math.min(MAX_CELLS, Number.isFinite(+n) ? Math.trunc(+n) : 256));
+    boot();
+  } };
 
   const guests = new Map();
   let nextSlot = 1;
@@ -2120,7 +2325,8 @@ async function startHost(el, inherit) {
   const wireGuest = (ch, pc, pos) => {
     const slot = slotPool.length ? slotPool.pop() : nextSlot++;
     if(slot >= NP) { pc.close(); return; }
-    const g = { dc: ch, pc, input: new Float32Array(6), seq: 0, lastIn: performance.now() };
+    const g = { dc: ch, pc, input: new Float32Array(6), seq: 0, fireSeq: 0, lastFireTick: -999,
+      lastSentTick: 0, lastIn: performance.now() };
     guests.set(slot, g);
     const r = 60 + (slot % 23) * 18, a = slot * 0.7;
     if(bufs) device.queue.writeBuffer(bufs.players, slot * 32,
@@ -2128,14 +2334,15 @@ async function startHost(el, inherit) {
         ? [Math.max(-448, Math.min(448, pos[0])), Math.max(1, Math.min(255, pos[1] + 2)), Math.max(-448, Math.min(448, pos[2])), 0, 0, 0, 0, 1]
         : [Math.cos(a) * r, 255, Math.sin(a) * r, 0, 0, 0, 0, 1]));
     ch.onmessage = (e) => {
-      g.lastIn = performance.now();
       const v = new DataView(e.data);
-      if(v.getUint8(0) !== 1) return;
+      if(!packetHas(v, 0, 2) || v.getUint8(0) !== 1) return;
       const count = v.getUint8(1);
+      if(count < 1 || count > 3 || !packetHas(v, 2, count * 28)) return;
+      g.lastIn = performance.now();
       for(let m = 0; m < count; m++) {
         const o = 2 + m * 28;
         const seq = v.getUint32(o, true);
-        if(seq <= g.seq) continue;
+        if(!seqNewer(seq, g.seq)) continue;
         g.seq = seq;
         const clean = (val, lim) => Number.isFinite(val) ? Math.max(-lim, Math.min(lim, val)) : 0;
         let mx = clean(v.getFloat32(o + 4, true), 1), mz = clean(v.getFloat32(o + 8, true), 1);
@@ -2146,7 +2353,7 @@ async function startHost(el, inherit) {
         g.input[3] = clean(v.getFloat32(o + 16, true), 15);
         g.input[4] = clean(v.getFloat32(o + 20, true), 1.55);
         g.input[5] = clean(v.getFloat32(o + 24, true), 1e9);
-        if((g.input[3] | 0) & 1) g.fire = 1;
+        if((g.input[3] | 0) & 1) { g.fire = 1; g.fireSeq = seq; }
         if((g.input[3] | 0) & 8) g.dig = 1;
       }
     };
@@ -2299,6 +2506,7 @@ async function startHost(el, inherit) {
     const zeroHit = new Uint32Array(2);
     let lastPlayers = ps.slice();
     let cells = 1, tick = 0, slot = 0;
+    let hostLastFireTick = -999;
     stats.tick = 0; stats.sim.length = stats.read.length = stats.cells.length = stats.total.length = 0;
 
     const step = async () => {
@@ -2327,18 +2535,20 @@ async function startHost(el, inherit) {
       const shotEvents = [];
       let ackSeq = 0;
       const hi = globalThis.hostInput;
+      const hostWantsFire = !!globalThis.hostFire;
+      globalThis.hostFire = 0;
       if(hi) {
         ackSeq = hi.seq;
         inputs[0] = hi.fx; inputs[1] = hi.fz; inputs[2] = hi.yaw;
         inputs[3] = hi.buttons & 6; inputs[4] = hi.pitch; inputs[5] = tick;
-        if(globalThis.hostFire) {
-          globalThis.hostFire = 0;
+        if(hostWantsFire && tick - hostLastFireTick >= FIRE_COOLDOWN_TICKS) {
+          hostLastFireTick = tick;
           const cp = Math.cos(hi.pitch);
           const d = [cp * Math.sin(hi.yaw), Math.sin(hi.pitch), cp * Math.cos(hi.yaw)];
-          const delay = hi.aim > 0 ? Math.max(0, Math.min(15, Math.round(tick - hi.aim))) : 2;
+          const delay = hi.aim > 0 ? Math.max(0, Math.min(MAX_REWIND_TICKS, tick, Math.round(tick - hi.aim))) : Math.min(2, tick);
           const b = new Float32Array([
             lastPlayers[0], lastPlayers[1] + 16, lastPlayers[2], delay * 1024,
-            d[0] * BULLET_SPEED, d[1] * BULLET_SPEED, d[2] * BULLET_SPEED, BULLET_LIFE,
+            d[0] * BULLET_SPEED, d[1] * BULLET_SPEED, d[2] * BULLET_SPEED, NEW_BULLET_MARKER + delay,
           ]);
           device.queue.writeBuffer(bufs.bullets, slot * 32, b);
           slot = (slot + 1) % Math.max(256, NP);
@@ -2373,12 +2583,15 @@ async function startHost(el, inherit) {
       for(const [gslot, g] of guests) {
         if(gslot >= NP || !g.fire) continue;
         g.fire = 0;
+        if(tick - g.lastFireTick < FIRE_COOLDOWN_TICKS) continue;
+        g.lastFireTick = tick;
         const yaw = g.input[2], pitch = g.input[4], cp = Math.cos(pitch);
         const d = [cp * Math.sin(yaw), Math.sin(pitch), cp * Math.cos(yaw)];
-        const gd = g.input[5] > 0 ? Math.max(0, Math.min(15, Math.round(tick - g.input[5]))) : 2;
+        const claimedAim = Math.max(g.lastSentTick - MAX_REWIND_TICKS, Math.min(g.lastSentTick, g.input[5]));
+        const gd = g.input[5] > 0 ? Math.max(0, Math.min(MAX_REWIND_TICKS, tick, Math.round(tick - claimedAim))) : Math.min(2, tick);
         const b = new Float32Array([
           lastPlayers[gslot * 8], lastPlayers[gslot * 8 + 1] + 16, lastPlayers[gslot * 8 + 2], gslot + gd * 1024,
-          d[0] * BULLET_SPEED, d[1] * BULLET_SPEED, d[2] * BULLET_SPEED, BULLET_LIFE,
+          d[0] * BULLET_SPEED, d[1] * BULLET_SPEED, d[2] * BULLET_SPEED, NEW_BULLET_MARKER + gd,
         ]);
         device.queue.writeBuffer(bufs.bullets, slot * 32, b);
         slot = (slot + 1) % maxBullets;
@@ -2393,7 +2606,7 @@ async function startHost(el, inherit) {
       p.setPipeline(pipes.visibility); p.setBindGroup(0, groups.visibility);
       p.dispatchWorkgroups(g, g);
       p.setPipeline(pipes.fly_bullets); p.setBindGroup(0, groups.fly_bullets);
-      p.dispatchWorkgroups(maxBullets / 64);
+      p.dispatchWorkgroups(Math.ceil(maxBullets / 64));
       p.setPipeline(pipes.carve_craters); p.setBindGroup(0, groups.carve_craters);
       p.dispatchWorkgroups(16, 64);
       p.end();
@@ -2564,6 +2777,7 @@ async function startHost(el, inherit) {
           o += 16;
         }
         g.dc.send(out.buffer);
+        g.lastSentTick = tick;
         hostTx += out.buffer.byteLength;
       }
       stats.snap.push(performance.now() - tS);
